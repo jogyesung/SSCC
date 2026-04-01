@@ -72,6 +72,28 @@ def load_config():
         "lat": 37.28,
         "lon": 127.43,
     })
+    config.setdefault("news_categories", {
+        "industry": {
+            "label": "골프장 산업 동향",
+            "keywords_kr": ["골프장 경영", "골프장 산업", "골프 리조트", "골프장 개장", "골프장 회원권", "골프장 매출"],
+            "keywords_en": ["golf course industry", "golf resort business"],
+        },
+        "tournament": {
+            "label": "골프 대회/투어",
+            "keywords_kr": ["PGA 투어", "LPGA", "KPGA", "KLPGA", "골프 대회", "마스터즈", "US오픈 골프"],
+            "keywords_en": ["PGA Tour", "LPGA Tour"],
+        },
+        "equipment": {
+            "label": "골프 장비/시장",
+            "keywords_kr": ["골프 장비", "골프 용품", "골프 시장", "골프웨어", "골프 브랜드"],
+            "keywords_en": ["golf equipment market", "golf industry market"],
+        },
+        "policy": {
+            "label": "골프 정책/규제",
+            "keywords_kr": ["골프장 규제", "골프 정책", "골프장 세금", "체육시설법", "골프장 환경"],
+            "keywords_en": ["golf regulation Korea"],
+        },
+    })
     config.setdefault("max_articles_per_category", 8)
     config.setdefault("max_age_days", 3)
     config.setdefault("blocked_domains", ["pinterest.com", "youtube.com"])
