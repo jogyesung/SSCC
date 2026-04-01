@@ -116,6 +116,33 @@ def _is_korean(text):
     return bool(re.search(r"[\uac00-\ud7a3]", text))
 
 
+def _title_tokens(title):
+    """제목에서 비교용 핵심 토큰 추출 (조사/특수문자 제거)"""
+    # 특수문자, 따옴표, 괄호 등 제거
+    cleaned = re.sub(r"[^\w\s]", " ", title)
+    # 소문자 변환 후 토큰 분리, 1글자 제거
+    tokens = set(t.lower() for t in cleaned.split() if len(t) > 1)
+    return tokens
+
+
+def _is_similar_title(new_title, existing_titles, threshold=0.5):
+    """기존 제목들과 유사도 비교. threshold 이상 겹치면 중복으로 판단"""
+    new_tokens = _title_tokens(new_title)
+    if not new_tokens:
+        return False
+
+    for existing in existing_titles:
+        existing_tokens = _title_tokens(existing)
+        if not existing_tokens:
+            continue
+        # Jaccard 유사도
+        intersection = new_tokens & existing_tokens
+        union = new_tokens | existing_tokens
+        if len(intersection) / len(union) >= threshold:
+            return True
+    return False
+
+
 def _normalize_url(url):
     """URL 정규화 (추적 파라미터 제거)"""
     parsed = urlparse(url)
@@ -351,6 +378,7 @@ def collect_news(config):
 
     all_news = {}
     seen_urls = set()
+    seen_titles = []  # 제목 유사도 비교용
 
     for cat_key, cat_config in categories.items():
         label = cat_config.get("label", cat_key)
@@ -374,8 +402,11 @@ def collect_news(config):
 
             for article in articles:
                 normalized = _normalize_url(article["link"])
-                if normalized not in seen_urls:
+                title = article["title"]
+                # URL 중복 + 제목 유사도 중복 모두 체크
+                if normalized not in seen_urls and not _is_similar_title(title, seen_titles):
                     seen_urls.add(normalized)
+                    seen_titles.append(title)
                     cat_articles.append(article)
 
             time.sleep(0.5)  # Google News 요청 간격
@@ -396,6 +427,7 @@ def collect_golf_course_news(config):
     keywords = [golf["name"], f"{golf['location']} 골프장"]
     articles = []
     seen_urls = set()
+    seen_titles = []
 
     print(f"  [자사 뉴스] {golf['name']} 관련 뉴스 수집 중...")
 
@@ -404,8 +436,10 @@ def collect_golf_course_news(config):
         results = fetch_rss(url, limit=5, max_age_days=max_age, blocked_domains=blocked)
         for article in results:
             normalized = _normalize_url(article["link"])
-            if normalized not in seen_urls:
+            title = article["title"]
+            if normalized not in seen_urls and not _is_similar_title(title, seen_titles):
                 seen_urls.add(normalized)
+                seen_titles.append(title)
                 articles.append(article)
         time.sleep(0.5)
 
