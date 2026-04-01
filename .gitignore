@@ -1,0 +1,6 @@
+config.json
+브리핑_*.html
+__pycache__/
+*.pyc
+.env
+.DS_Store
