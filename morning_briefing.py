@@ -68,9 +68,9 @@ def load_config():
     config.setdefault("golf_course", {
         "name": "사우스스프링스",
         "name_en": "South Springs",
-        "location": "충남 아산",
-        "lat": 36.78,
-        "lon": 127.00,
+        "location": "경기도 이천",
+        "lat": 37.28,
+        "lon": 127.43,
     })
     config.setdefault("max_articles_per_category", 8)
     config.setdefault("max_age_days", 3)
@@ -428,7 +428,7 @@ def generate_analysis(config, weather_data, news, self_news):
         return ""
 
     today = datetime.now(tz=KST)
-    today_str = today.strftime("%Y년 %m월 %d일 (%s)") % WEEKDAY_KR[today.weekday()]
+    today_str = f"{today.strftime('%Y년 %m월 %d일')} ({WEEKDAY_KR[today.weekday()]})"
 
     # 날씨 요약
     weather_summary = "날씨 정보 없음"
