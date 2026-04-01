@@ -93,6 +93,11 @@ def load_config():
             "keywords_kr": ["골프장 규제", "골프 정책", "골프장 세금", "체육시설법", "골프장 환경"],
             "keywords_en": ["golf regulation Korea"],
         },
+        "global": {
+            "label": "해외 골프 뉴스",
+            "keywords_en": ["golf industry news", "PGA Tour", "golf course management", "golf business"],
+            "lang": "en",
+        },
     })
     config.setdefault("max_articles_per_category", 8)
     config.setdefault("max_age_days", 3)
@@ -349,13 +354,22 @@ def collect_news(config):
 
     for cat_key, cat_config in categories.items():
         label = cat_config.get("label", cat_key)
-        keywords = cat_config.get("keywords_kr", []) + cat_config.get("keywords_en", [])
+        lang = cat_config.get("lang", "ko")
+
+        # 해외 뉴스는 영문 키워드만, 국내 뉴스는 한국어+영문 키워드
+        if lang == "en":
+            keywords = cat_config.get("keywords_en", [])
+        else:
+            keywords = cat_config.get("keywords_kr", []) + cat_config.get("keywords_en", [])
 
         print(f"  [{label}] 뉴스 수집 중...")
         cat_articles = []
 
         for keyword in keywords:
-            url = _gn(keyword)
+            if lang == "en":
+                url = _gn(keyword, hl="en", gl="US")
+            else:
+                url = _gn(keyword)
             articles = fetch_rss(url, limit=max_articles, max_age_days=max_age, blocked_domains=blocked)
 
             for article in articles:
@@ -442,6 +456,52 @@ def translate_titles(titles, api_key):
         return {}
 
 
+def summarize_global_articles(articles, api_key):
+    """해외 골프 뉴스 영문 기사를 국문 제목+요약으로 변환 (Claude Haiku)"""
+    if not articles or not api_key:
+        return articles
+
+    numbered = "\n".join(f"{i+1}. {a['title']}" for i, a in enumerate(articles))
+    prompt = f"""다음은 해외 골프 뉴스 영문 기사 제목들입니다.
+각 기사에 대해 아래 형식으로 출력해주세요:
+
+번호. [한국어 제목 번역]
+요약: [기사 제목에서 유추할 수 있는 핵심 내용을 한국어 1-2문장으로 요약]
+
+{numbered}"""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result_text = response.content[0].text.strip()
+
+        # 파싱: "번호. 제목\n요약: ..." 형식
+        current_idx = None
+        for line in result_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+
+            title_match = re.match(r"(\d+)\.\s*\[?(.+?)\]?\s*$", line)
+            summary_match = re.match(r"요약:\s*(.+)", line)
+
+            if title_match:
+                current_idx = int(title_match.group(1)) - 1
+                if 0 <= current_idx < len(articles):
+                    articles[current_idx]["title_kr"] = title_match.group(2).strip("[]")
+            elif summary_match and current_idx is not None and 0 <= current_idx < len(articles):
+                articles[current_idx]["summary_kr"] = summary_match.group(1)
+
+        return articles
+    except Exception as e:
+        print(f"[AI] 해외 뉴스 요약 실패: {e}")
+        return articles
+
+
 def generate_analysis(config, weather_data, news, self_news):
     """경영진 핵심 포인트 생성 (Claude Haiku)"""
     api_key = config.get("claude_api_key", "")
@@ -505,7 +565,7 @@ def generate_analysis(config, weather_data, news, self_news):
 # HTML 생성
 # ──────────────────────────────────────────────
 
-def _build_news_section(title, icon, articles, bg_color="#ffffff"):
+def _build_news_section(title, icon, articles, bg_color="#ffffff", show_summary=False):
     """뉴스 카테고리 HTML 섹션 생성"""
     if not articles:
         return ""
@@ -515,10 +575,21 @@ def _build_news_section(title, icon, articles, bg_color="#ffffff"):
         source_badge = f'<span style="color:#888;font-size:12px;">{article["source"]}</span>' if article["source"] else ""
         date_badge = f'<span style="color:#aaa;font-size:11px;margin-left:8px;">{article["published"]}</span>' if article["published"] else ""
 
+        # 해외 뉴스: 한국어 제목 + 요약 표시
+        display_title = article.get("title_kr", article["title"]) if show_summary else article["title"]
+        summary_html = ""
+        if show_summary and article.get("summary_kr"):
+            summary_html = f'<div style="color:#555;font-size:13px;margin-top:4px;padding:6px 10px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;">{article["summary_kr"]}</div>'
+        original_title = ""
+        if show_summary and article.get("title_kr"):
+            original_title = f'<div style="color:#999;font-size:11px;margin-top:2px;">{article["title"]}</div>'
+
         rows += f"""
         <tr>
           <td style="padding:8px 16px;border-bottom:1px solid #f0f0f0;font-size:14px;line-height:1.6;">
-            <a href="{article['link']}" style="color:#1a1a1a;text-decoration:none;" target="_blank">{article['title']}</a>
+            <a href="{article['link']}" style="color:#1a1a1a;text-decoration:none;" target="_blank">{display_title}</a>
+            {original_title}
+            {summary_html}
             <br>{source_badge}{date_badge}
           </td>
         </tr>"""
@@ -659,13 +730,15 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
         "tournament": "🏆",
         "equipment": "⛳",
         "policy": "📜",
+        "global": "🌍",
     }
     news_sections = ""
-    for cat_key in ["industry", "tournament", "equipment", "policy"]:
+    for cat_key in ["industry", "tournament", "equipment", "policy", "global"]:
         if cat_key in news and news[cat_key]:
             label = categories_config.get(cat_key, {}).get("label", cat_key)
             icon = icon_map.get(cat_key, "📰")
-            news_sections += _build_news_section(label, icon, news[cat_key])
+            is_global = (cat_key == "global")
+            news_sections += _build_news_section(label, icon, news[cat_key], show_summary=is_global)
 
     # ── 자사 뉴스 섹션 ──
     self_section = ""
@@ -817,11 +890,21 @@ def main():
 
         # 4. AI 처리
         print("\n[4/6] AI 분석 처리...")
-        # 번역
+        api_key = config.get("claude_api_key", "")
+
+        # 해외 뉴스 국문 요약
+        if news.get("global"):
+            print("  해외 뉴스 국문 요약 중...")
+            news["global"] = summarize_global_articles(news["global"], api_key)
+            summarized = sum(1 for a in news["global"] if a.get("summary_kr"))
+            print(f"  해외 뉴스 {summarized}건 요약 완료")
+
+        # 번역 (해외 뉴스 제외 - 이미 요약 처리됨)
         all_titles = []
-        for articles in news.values():
-            all_titles.extend(a["title"] for a in articles)
-        translations = translate_titles(all_titles, config.get("claude_api_key", ""))
+        for cat_key, articles in news.items():
+            if cat_key != "global":
+                all_titles.extend(a["title"] for a in articles)
+        translations = translate_titles(all_titles, api_key)
         if translations:
             print(f"  {len(translations)}건 번역 완료")
 
