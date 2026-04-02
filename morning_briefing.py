@@ -100,7 +100,7 @@ def load_config():
         },
     })
     config.setdefault("max_articles_per_category", 8)
-    config.setdefault("max_age_days", 3)
+    config.setdefault("max_age_days", 2)
     config.setdefault("blocked_domains", ["pinterest.com", "youtube.com"])
 
     return config
