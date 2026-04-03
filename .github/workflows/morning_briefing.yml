@@ -2,8 +2,8 @@ name: 사우스스프링스 골프 모닝브리핑
 
 on:
   schedule:
-    # 평일 오전 7:30 KST = 전일 22:30 UTC (일~목)
-    - cron: '30 22 * * 0-4'
+    # 평일 오전 7:00 KST = 전일 22:00 UTC (일~목)
+    - cron: '0 22 * * 0-4'
   workflow_dispatch:
 
 jobs:
