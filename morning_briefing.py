@@ -55,8 +55,14 @@ def load_config():
     # 환경변수 오버라이드 (GitHub Actions용)
     if os.environ.get("CLAUDE_API_KEY"):
         config["claude_api_key"] = os.environ["CLAUDE_API_KEY"]
+    if os.environ.get("EMAIL_PASSWORD"):
+        config["email_password"] = os.environ["EMAIL_PASSWORD"]
     if os.environ.get("GMAIL_APP_PASSWORD"):
         config["gmail_app_password"] = os.environ["GMAIL_APP_PASSWORD"]
+    if os.environ.get("SMTP_HOST"):
+        config["smtp_host"] = os.environ["SMTP_HOST"]
+    if os.environ.get("SMTP_PORT"):
+        config["smtp_port"] = os.environ["SMTP_PORT"]
     if os.environ.get("EMAIL_FROM"):
         config["email_from"] = os.environ["EMAIL_FROM"]
     if os.environ.get("EMAIL_TO"):
@@ -855,10 +861,14 @@ def save_html(html_content):
 
 
 def send_email(config, html_content):
-    """Gmail SMTP를 통한 이메일 발송"""
+    """SMTP를 통한 이메일 발송 (Outlook/Office 365 또는 Gmail 지원)"""
     email_from = config.get("email_from", "")
     email_to = config.get("email_to", "")
-    password = config.get("gmail_app_password", "")
+    password = config.get("email_password", "") or config.get("gmail_app_password", "")
+
+    # SMTP 설정 (기본: Outlook/Office 365)
+    smtp_host = config.get("smtp_host", "smtp.office365.com")
+    smtp_port = int(config.get("smtp_port", 587))
 
     if not all([email_from, email_to, password]):
         print("[이메일] 이메일 설정이 완료되지 않았습니다. 발송을 건너뜁니다.")
@@ -879,7 +889,7 @@ def send_email(config, html_content):
     msg.attach(MIMEText(html_content, "html", "utf-8"))
 
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.starttls()
             server.login(email_from, password)
             server.sendmail(email_from, recipients, msg.as_string())

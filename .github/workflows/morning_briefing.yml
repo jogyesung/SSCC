@@ -25,7 +25,9 @@ jobs:
       - name: Generate and send briefing
         env:
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           WEATHER_API_KEY: ${{ secrets.WEATHER_API_KEY }}

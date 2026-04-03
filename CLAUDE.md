@@ -21,7 +21,9 @@ python morning_briefing.py
 
 ## 환경변수 (GitHub Actions Secrets)
 - `CLAUDE_API_KEY` — Anthropic API 키
-- `GMAIL_APP_PASSWORD` — Gmail 앱 비밀번호
+- `EMAIL_PASSWORD` — 이메일 비밀번호 (Outlook/Office 365)
+- `SMTP_HOST` — SMTP 서버 주소 (기본: smtp.office365.com)
+- `SMTP_PORT` — SMTP 포트 (기본: 587)
 - `EMAIL_FROM` — 발신 이메일
 - `EMAIL_TO` — 수신 이메일 (쉼표 구분)
 - `WEATHER_API_KEY` — OpenWeatherMap API 키
