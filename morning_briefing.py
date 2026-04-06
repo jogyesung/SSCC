@@ -871,7 +871,14 @@ def send_email(config, html_content):
     smtp_port = int(config.get("smtp_port", 587))
 
     if not all([email_from, email_to, password]):
-        print("[이메일] 이메일 설정이 완료되지 않았습니다. 발송을 건너뜁니다.")
+        missing = []
+        if not email_from:
+            missing.append("EMAIL_FROM")
+        if not email_to:
+            missing.append("EMAIL_TO")
+        if not password:
+            missing.append("EMAIL_PASSWORD")
+        print(f"[이메일] 이메일 설정이 완료되지 않았습니다. 누락: {', '.join(missing)}")
         return False
 
     now = datetime.now(tz=KST)
