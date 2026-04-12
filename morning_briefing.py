@@ -12,6 +12,7 @@ import sys
 import smtplib
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -28,6 +29,17 @@ from bs4 import BeautifulSoup
 
 KST = timezone(timedelta(hours=9))
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
+
+# 모듈 전역 Anthropic 클라이언트 (재사용)
+_anthropic_client = None
+
+
+def _get_client(api_key):
+    """Anthropic 클라이언트 lazy singleton"""
+    global _anthropic_client
+    if _anthropic_client is None and api_key:
+        _anthropic_client = anthropic.Anthropic(api_key=api_key)
+    return _anthropic_client
 
 WEATHER_ICON_MAP = {
     "Clear": "☀️",
@@ -425,78 +437,105 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
 
 
 def collect_news(config):
-    """카테고리별 뉴스 수집 + 중복 제거"""
+    """카테고리별 뉴스 수집 + 중복 제거 (병렬 RSS fetch)"""
     categories = config.get("news_categories", {})
     max_articles = config.get("max_articles_per_category", 8)
     max_age = config.get("max_age_days", 3)
     blocked = config.get("blocked_domains", [])
 
-    all_news = {}
-    seen_urls = set()
-    seen_titles = []  # 제목 유사도 비교용
-
+    # 모든 (카테고리, URL) 태스크 빌드
+    tasks = []
     for cat_key, cat_config in categories.items():
-        label = cat_config.get("label", cat_key)
         lang = cat_config.get("lang", "ko")
-
-        # 해외 뉴스는 영문 키워드만, 국내 뉴스는 한국어+영문 키워드
         if lang == "en":
             keywords = cat_config.get("keywords_en", [])
         else:
             keywords = cat_config.get("keywords_kr", []) + cat_config.get("keywords_en", [])
-
-        print(f"  [{label}] 뉴스 수집 중...")
-        cat_articles = []
-
         for keyword in keywords:
             if lang == "en":
                 url = _gn(keyword, hl="en", gl="US")
             else:
                 url = _gn(keyword)
-            articles = fetch_rss(url, limit=max_articles, max_age_days=max_age, blocked_domains=blocked)
+            tasks.append((cat_key, url))
 
-            for article in articles:
-                normalized = _normalize_url(article["link"])
-                title = article["title"]
-                # URL 중복 + 제목 유사도 중복 모두 체크
-                if normalized not in seen_urls and not _is_similar_title(title, seen_titles):
-                    seen_urls.add(normalized)
-                    seen_titles.append(title)
-                    cat_articles.append(article)
+    print(f"  전체 {len(tasks)}개 RSS 피드 병렬 수집 중...")
 
-            time.sleep(0.5)  # Google News 요청 간격
+    # 병렬 fetch (카테고리 순서 유지 위해 인덱스로 결과 정렬)
+    fetched = [None] * len(tasks)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(fetch_rss, url, max_articles, max_age, blocked): i
+            for i, (_, url) in enumerate(tasks)
+        }
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                fetched[i] = future.result()
+            except Exception as e:
+                print(f"[뉴스] RSS fetch 실패: {e}")
+                fetched[i] = []
 
-        # 카테고리당 최대 기사 수 제한
-        all_news[cat_key] = cat_articles[:max_articles]
-        print(f"  [{label}] {len(all_news[cat_key])}건 수집 완료")
+    # 카테고리별 병합 + 전역 중복 제거
+    all_news = {cat_key: [] for cat_key in categories}
+    seen_urls = set()
+    seen_titles = []
+
+    for i, (cat_key, _) in enumerate(tasks):
+        for article in (fetched[i] or []):
+            normalized = _normalize_url(article["link"])
+            title = article["title"]
+            if normalized in seen_urls:
+                continue
+            if _is_similar_title(title, seen_titles):
+                continue
+            seen_urls.add(normalized)
+            seen_titles.append(title)
+            all_news[cat_key].append(article)
+
+    for cat_key, cat_config in categories.items():
+        label = cat_config.get("label", cat_key)
+        all_news[cat_key] = all_news[cat_key][:max_articles]
+        print(f"  [{label}] {len(all_news[cat_key])}건 수집")
 
     return all_news
 
 
 def collect_golf_course_news(config):
-    """자사(사우스스프링스) 관련 뉴스 모니터링"""
+    """자사(사우스스프링스) 관련 뉴스 모니터링 (병렬 RSS fetch)"""
     golf = config["golf_course"]
     max_age = config.get("max_age_days", 3)
     blocked = config.get("blocked_domains", [])
 
     keywords = [golf["name"], f"{golf['location']} 골프장"]
+    urls = [_gn(k) for k in keywords]
+
+    print(f"  [자사 뉴스] {golf['name']} 관련 뉴스 병렬 수집 중...")
+
+    fetched_lists = [[]] * len(urls)
+    with ThreadPoolExecutor(max_workers=len(urls)) as executor:
+        futures = {
+            executor.submit(fetch_rss, url, 5, max_age, blocked): i
+            for i, url in enumerate(urls)
+        }
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                fetched_lists[i] = future.result()
+            except Exception as e:
+                print(f"[자사 뉴스] 오류: {e}")
+                fetched_lists[i] = []
+
     articles = []
     seen_urls = set()
     seen_titles = []
-
-    print(f"  [자사 뉴스] {golf['name']} 관련 뉴스 수집 중...")
-
-    for keyword in keywords:
-        url = _gn(keyword)
-        results = fetch_rss(url, limit=5, max_age_days=max_age, blocked_domains=blocked)
-        for article in results:
+    for lst in fetched_lists:
+        for article in lst:
             normalized = _normalize_url(article["link"])
             title = article["title"]
             if normalized not in seen_urls and not _is_similar_title(title, seen_titles):
                 seen_urls.add(normalized)
                 seen_titles.append(title)
                 articles.append(article)
-        time.sleep(0.5)
 
     print(f"  [자사 뉴스] {len(articles)}건 수집 완료")
     return articles[:5]
@@ -506,194 +545,99 @@ def collect_golf_course_news(config):
 # AI 처리 (Claude)
 # ──────────────────────────────────────────────
 
-def translate_titles(titles, api_key):
-    """영문 제목을 한국어로 번역 (Claude Haiku)"""
-    if not titles or not api_key:
-        return {}
-
-    # 한국어가 아닌 제목만 필터
-    to_translate = {i: t for i, t in enumerate(titles) if not _is_korean(t)}
-    if not to_translate:
-        return {}
-
-    numbered = "\n".join(f"{i+1}. {t}" for i, t in to_translate.items())
-    prompt = f"""다음 영문 골프 뉴스 제목들을 자연스러운 한국어로 번역해주세요.
-번역만 출력하고 번호를 유지해주세요.
-
-{numbered}"""
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        result_text = response.content[0].text
-
-        translations = {}
-        for line in result_text.strip().split("\n"):
-            line = line.strip()
-            match = re.match(r"(\d+)\.\s*(.+)", line)
-            if match:
-                idx = int(match.group(1)) - 1
-                translations[idx] = match.group(2)
-
-        return translations
-    except Exception as e:
-        print(f"[AI] 번역 실패: {e}")
-        return {}
-
-
-def summarize_global_articles(articles, api_key):
-    """해외 골프 뉴스 영문 기사를 국문 제목+요약으로 변환 (Claude Haiku)"""
+def process_articles(articles, api_key, label="", is_global=False):
+    """단일 Claude Haiku 호출로 중복 제거 + 요약(+해외 제목 번역)을 일괄 수행.
+    이전 dedup_with_ai + summarize_korean_articles + summarize_global_articles를 통합한 함수."""
     if not articles or not api_key:
         return articles
 
     numbered = "\n".join(f"{i+1}. {a['title']}" for i, a in enumerate(articles))
-    prompt = f"""다음은 해외 골프 뉴스 영문 기사 제목들입니다.
-각 기사에 대해 아래 형식으로 출력해주세요:
 
-번호. [한국어 제목 번역]
-요약: [기사 제목에서 유추할 수 있는 핵심 내용을 한국어 1-2문장으로 요약]
+    if is_global:
+        prompt = f"""다음은 해외 골프 뉴스 영문 기사 제목 목록입니다.
+
+작업:
+(1) 같은 사건/주제를 다룬 기사는 그룹화하여 가장 정보가 풍부한 1개만 남기세요.
+(2) 남긴 기사 각각에 대해 한국어 제목 번역과 국문 요약(1-2문장)을 작성하세요.
+
+반드시 아래 형식으로만 출력하세요. 설명·머리말·꼬리말 금지:
+===번호===
+제목: 한국어 제목 번역
+요약: 국문 요약 1-2문장
+
+{numbered}"""
+    else:
+        prompt = f"""다음은 골프 관련 뉴스 기사 제목 목록입니다.
+
+작업:
+(1) 같은 사건/주제 기사는 그룹화하여 가장 정보가 풍부하고 구체적인 1개만 남기세요.
+(2) 남긴 기사마다 핵심 내용을 경영진이 이해할 수 있도록 한국어 1문장(40자 이내)으로 요약하세요.
+
+판단 기준: 같은 프로젝트/사건/대회/제품/주체를 다루면 동일 그룹.
+
+반드시 아래 형식으로만 출력하세요. 설명·머리말·꼬리말 금지:
+===번호===
+(요약 1문장)
 
 {numbered}"""
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        client = _get_client(api_key)
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
-        result_text = response.content[0].text.strip()
+        result = response.content[0].text.strip()
 
-        # 파싱: "번호. 제목\n요약: ..." 형식
+        kept = {}
         current_idx = None
-        for line in result_text.split("\n"):
-            line = line.strip()
+        for raw_line in result.split("\n"):
+            line = raw_line.strip()
             if not line:
                 continue
-
-            title_match = re.match(r"(\d+)\.\s*\[?(.+?)\]?\s*$", line)
-            summary_match = re.match(r"요약:\s*(.+)", line)
-
-            if title_match:
-                current_idx = int(title_match.group(1)) - 1
-                if 0 <= current_idx < len(articles):
-                    articles[current_idx]["title_kr"] = title_match.group(2).strip("[]")
-            elif summary_match and current_idx is not None and 0 <= current_idx < len(articles):
-                articles[current_idx]["summary_kr"] = summary_match.group(1)
-
-        return articles
-    except Exception as e:
-        print(f"[AI] 해외 뉴스 요약 실패: {e}")
-        return articles
-
-
-def dedup_with_ai(articles, api_key, label=""):
-    """Claude Haiku로 같은 사건/주제 기사를 그룹화하고 대표 기사만 남긴다.
-    토큰 매칭으로 잡기 어려운 표현 차이(서로 다른 신문사의 같은 사건)를 제거한다."""
-    if not articles or len(articles) <= 1 or not api_key:
-        return articles
-
-    numbered = "\n".join(f"{i+1}. {a['title']}" for i, a in enumerate(articles))
-    prompt = f"""다음은 골프 관련 뉴스 기사 제목 목록입니다.
-같은 사건/주제를 다루는 기사들을 그룹으로 묶고, 각 그룹에서 가장 대표적인
-(정보가 풍부하고 구체적인) 기사 1개의 번호만 남겨주세요.
-서로 다른 주제라면 각각 독립된 그룹으로 유지하세요.
-
-판단 기준:
-- 같은 프로젝트/사건/대회/제품을 다루면 동일 그룹
-- 표현이 달라도 핵심 내용이 같으면 동일 그룹
-- 장소·대상·주체가 같고 맥락이 같으면 동일 그룹
-
-출력 형식: 남길 기사 번호만 쉼표로 구분 (예: 1,3,5,7)
-설명 없이 번호만 출력하세요.
-
-{numbered}"""
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=256,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        result = response.content[0].text.strip()
-
-        keep_indices = set()
-        for part in re.split(r"[,\s]+", result):
-            part = part.strip()
-            if part.isdigit():
-                idx = int(part) - 1
+            tag_match = re.match(r"===\s*(\d+)\s*===", line)
+            if tag_match:
+                idx = int(tag_match.group(1)) - 1
                 if 0 <= idx < len(articles):
-                    keep_indices.add(idx)
+                    current_idx = idx
+                    kept.setdefault(current_idx, {})
+                else:
+                    current_idx = None
+                continue
+            if current_idx is None:
+                continue
+            if is_global:
+                m = re.match(r"제목\s*[:：]\s*(.+)", line)
+                if m:
+                    kept[current_idx]["title_kr"] = m.group(1).strip().strip("[]")
+                    continue
+                m = re.match(r"요약\s*[:：]\s*(.+)", line)
+                if m:
+                    kept[current_idx]["summary_kr"] = m.group(1).strip()
+                    continue
+            else:
+                if "summary_kr" not in kept[current_idx]:
+                    kept[current_idx]["summary_kr"] = line
 
-        if not keep_indices:
+        if not kept:
+            print(f"  [{label}] AI 응답 파싱 실패, 원본 유지")
             return articles
 
-        deduped = [a for i, a in enumerate(articles) if i in keep_indices]
-        removed = len(articles) - len(deduped)
+        result_articles = []
+        for idx in sorted(kept.keys()):
+            merged = dict(articles[idx])
+            merged.update(kept[idx])
+            result_articles.append(merged)
+
+        removed = len(articles) - len(result_articles)
         if removed > 0:
-            print(f"  [AI 중복제거] {label}: {removed}건 제거 ({len(articles)}→{len(deduped)})")
-        return deduped
+            print(f"  [{label}] 중복 {removed}건 제거 + 요약 완료 ({len(articles)}→{len(result_articles)})")
+        else:
+            print(f"  [{label}] 요약 완료 ({len(result_articles)}건)")
+        return result_articles
     except Exception as e:
-        print(f"  [AI 중복제거] {label} 실패: {e}")
-        return articles
-
-
-def summarize_korean_articles(articles, api_key, label=""):
-    """국내 골프 뉴스 제목을 바탕으로 1문장 국문 요약 생성 (Claude Haiku, 일괄 처리)"""
-    if not articles or not api_key:
-        return articles
-
-    # 태그 기반 일괄 요청 (claude-project 방식)
-    tagged = "\n".join(f"===T{i+1}===\n{a['title']}" for i, a in enumerate(articles))
-    prompt = f"""다음은 골프 관련 뉴스 기사 제목들입니다.
-각 기사에 대해 제목에서 유추할 수 있는 핵심 내용을 경영진이 한눈에 파악할 수 있도록
-한국어 1문장(40자 이내)으로 요약해주세요.
-
-반드시 ===T숫자=== 태그를 그대로 유지하고, 태그 바로 아래 줄에 요약 1문장만 출력하세요.
-제목을 단순히 반복하지 말고, 핵심 의미를 풀어서 설명해주세요.
-
-{tagged}"""
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        result = response.content[0].text.strip()
-
-        # 태그 기반 파싱
-        current_idx = None
-        current_lines = []
-        for line in result.split("\n"):
-            stripped = line.strip()
-            tag_match = re.match(r"===T(\d+)===", stripped)
-            if tag_match:
-                # 이전 항목 저장
-                if current_idx is not None and current_lines:
-                    idx = current_idx - 1
-                    if 0 <= idx < len(articles):
-                        articles[idx]["summary_kr"] = " ".join(current_lines).strip()
-                current_idx = int(tag_match.group(1))
-                current_lines = []
-            elif current_idx is not None and stripped:
-                current_lines.append(stripped)
-
-        # 마지막 항목 저장
-        if current_idx is not None and current_lines:
-            idx = current_idx - 1
-            if 0 <= idx < len(articles):
-                articles[idx]["summary_kr"] = " ".join(current_lines).strip()
-
-        return articles
-    except Exception as e:
-        print(f"[AI] {label} 요약 실패: {e}")
+        print(f"  [{label}] AI 처리 실패: {e}")
         return articles
 
 
@@ -713,21 +657,29 @@ def generate_analysis(config, weather_data, news, self_news):
         w = weather_data
         weather_summary = f"기온 {w['temp']}°C (체감 {w['feels_like']}°C), {w['description']}, 바람 {w['wind_speed']}m/s, 습도 {w['humidity']}%"
 
-    # 카테고리별 제목 정리
+    # 카테고리별 제목+요약 정리 (요약이 있으면 활용)
     categories_config = config.get("news_categories", {})
+
+    def _line(article, is_global=False):
+        title = article.get("title_kr") if is_global else None
+        title = title or article["title"]
+        summary = article.get("summary_kr", "")
+        return f"- {title} ({summary})" if summary else f"- {title}"
+
     sections = []
     for cat_key, articles in news.items():
         label = categories_config.get(cat_key, {}).get("label", cat_key)
-        titles = [a["title"] for a in articles[:5]]
-        if titles:
-            sections.append(f"[{label}]\n" + "\n".join(f"- {t}" for t in titles))
+        is_global = (cat_key == "global")
+        lines = [_line(a, is_global) for a in articles[:5]]
+        if lines:
+            sections.append(f"[{label}]\n" + "\n".join(lines))
 
     news_text = "\n\n".join(sections) if sections else "수집된 뉴스 없음"
 
     # 자사 뉴스
     self_text = ""
     if self_news:
-        self_text = "\n[자사 관련 뉴스]\n" + "\n".join(f"- {a['title']}" for a in self_news)
+        self_text = "\n[자사 관련 뉴스]\n" + "\n".join(_line(a) for a in self_news)
 
     prompt = f"""당신은 사우스스프링스 골프장 경영진을 위한 브리핑 분석가입니다.
 오늘 날짜: {today_str}
@@ -744,7 +696,7 @@ def generate_analysis(config, weather_data, news, self_news):
 형식: HTML <li> 태그로 출력. <ul>이나 </ul>은 포함하지 마세요."""
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        client = _get_client(api_key)
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=1024,
@@ -813,21 +765,13 @@ def _build_news_section(title, icon, articles, bg_color="#ffffff", is_global=Fal
     </table>"""
 
 
-def generate_briefing(config, current_weather, forecast, news, self_news, analysis, translations):
+def generate_briefing(config, current_weather, forecast, news, self_news, analysis):
     """전체 HTML 브리핑 생성"""
     now = datetime.now(tz=KST)
     date_str = now.strftime("%Y년 %m월 %d일")
     weekday = WEEKDAY_KR[now.weekday()]
     golf = config["golf_course"]
     categories_config = config.get("news_categories", {})
-
-    # 번역 적용
-    all_articles = []
-    for articles in news.values():
-        all_articles.extend(articles)
-    for idx, translated in translations.items():
-        if idx < len(all_articles):
-            all_articles[idx]["title"] = translated
 
     # ── 날씨 섹션 ──
     weather_section = ""
@@ -1074,88 +1018,93 @@ def send_email(config, html_content):
 
 def main():
     try:
+        t_start = time.time()
         print("=" * 50)
         print("사우스스프링스 골프 모닝브리핑 생성 시작")
         print("=" * 50)
 
         # 1. 설정 로드
-        print("\n[1/6] 설정 로드...")
+        print("\n[1/5] 설정 로드...")
         config = load_config()
         print(f"  골프장: {config['golf_course']['name']} ({config['golf_course']['location']})")
 
-        # 2. 날씨 수집
-        print("\n[2/6] 날씨 정보 수집...")
-        current_weather = get_current_weather(config)
-        forecast = get_weather_forecast(config)
+        # 2. 날씨 + 뉴스 수집 (모두 병렬)
+        print("\n[2/5] 날씨 & 뉴스 수집 (병렬)...")
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            fut_current = executor.submit(get_current_weather, config)
+            fut_forecast = executor.submit(get_weather_forecast, config)
+            fut_news = executor.submit(collect_news, config)
+            fut_self = executor.submit(collect_golf_course_news, config)
+
+            current_weather = fut_current.result()
+            forecast = fut_forecast.result()
+            news = fut_news.result()
+            self_news = fut_self.result()
+
         if current_weather:
-            print(f"  현재: {current_weather['temp']}°C, {current_weather['description']}")
+            print(f"  날씨: {current_weather['temp']}°C, {current_weather['description']}")
         else:
             print("  날씨 정보를 가져올 수 없습니다. 뉴스만 표시합니다.")
 
-        # 3. 뉴스 수집
-        print("\n[3/6] 골프 뉴스 수집...")
-        news = collect_news(config)
-        self_news = collect_golf_course_news(config)
-
         total_articles = sum(len(articles) for articles in news.values()) + len(self_news)
-        print(f"\n  총 {total_articles}건 수집 완료")
+        print(f"  수집 완료: 총 {total_articles}건 ({time.time()-t0:.1f}s)")
 
-        # 4. AI 처리
-        print("\n[4/6] AI 분석 처리...")
+        # 3. AI 처리 (중복 제거 + 요약을 단일 호출에 통합, 카테고리별 병렬)
+        print("\n[3/5] AI 중복 제거 + 요약 (병렬)...")
+        t0 = time.time()
         api_key = config.get("claude_api_key", "")
-
-        # AI 기반 중복 제거 (카테고리별)
         categories_config = config.get("news_categories", {})
-        for cat_key, articles in news.items():
-            if not articles:
-                continue
-            label = categories_config.get(cat_key, {}).get("label", cat_key)
-            news[cat_key] = dedup_with_ai(articles, api_key, label)
 
-        if self_news:
-            self_news = dedup_with_ai(self_news, api_key, "자사 뉴스")
+        if api_key and api_key != "YOUR_ANTHROPIC_API_KEY":
+            tasks = []  # (key, articles, label, is_global)
+            for cat_key, articles in news.items():
+                if not articles:
+                    continue
+                label = categories_config.get(cat_key, {}).get("label", cat_key)
+                is_global = (cat_key == "global")
+                tasks.append((cat_key, articles, label, is_global))
+            if self_news:
+                tasks.append(("__self__", self_news, "자사 뉴스", False))
 
-        # 해외 뉴스 국문 요약 (제목 번역 + 요약)
-        if news.get("global"):
-            print("  해외 뉴스 국문 요약 중...")
-            news["global"] = summarize_global_articles(news["global"], api_key)
-            summarized = sum(1 for a in news["global"] if a.get("summary_kr"))
-            print(f"  해외 뉴스 {summarized}건 요약 완료")
+            if tasks:
+                with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as executor:
+                    futures = {
+                        executor.submit(process_articles, articles, api_key, label, is_global): key
+                        for key, articles, label, is_global in tasks
+                    }
+                    for future in as_completed(futures):
+                        key = futures[future]
+                        try:
+                            processed = future.result()
+                        except Exception as e:
+                            print(f"  [{key}] 처리 예외: {e}")
+                            continue
+                        if key == "__self__":
+                            self_news = processed
+                        else:
+                            news[key] = processed
+        else:
+            print("  Claude API 키가 설정되지 않아 AI 처리를 건너뜁니다.")
+        print(f"  AI 처리 완료 ({time.time()-t0:.1f}s)")
 
-        # 국내 뉴스 카테고리별 요약
-        for cat_key, articles in news.items():
-            if cat_key == "global" or not articles:
-                continue
-            label = categories_config.get(cat_key, {}).get("label", cat_key)
-            print(f"  {label} 요약 중...")
-            news[cat_key] = summarize_korean_articles(articles, api_key, label)
-            summarized = sum(1 for a in news[cat_key] if a.get("summary_kr"))
-            print(f"  {label} {summarized}건 요약 완료")
-
-        # 자사 뉴스 요약
-        if self_news:
-            print("  자사 뉴스 요약 중...")
-            self_news = summarize_korean_articles(self_news, api_key, "자사 뉴스")
-
-        # 분석
+        # 핵심 포인트 (요약 반영됨)
+        print("\n  핵심 포인트 생성 중...")
         analysis = generate_analysis(config, current_weather, news, self_news)
         if analysis:
             print("  핵심 포인트 생성 완료")
 
-        # translations는 빈 dict로 유지 (요약에 한국어 제목이 이미 포함됨)
-        translations = {}
-
-        # 5. HTML 생성
-        print("\n[5/6] HTML 브리핑 생성...")
-        html = generate_briefing(config, current_weather, forecast, news, self_news, analysis, translations)
+        # 4. HTML 생성 & 저장
+        print("\n[4/5] HTML 브리핑 생성...")
+        html = generate_briefing(config, current_weather, forecast, news, self_news, analysis)
         filepath = save_html(html)
 
-        # 6. 이메일 발송
-        print("\n[6/6] 이메일 발송...")
+        # 5. 이메일 발송
+        print("\n[5/5] 이메일 발송...")
         send_email(config, html)
 
         print("\n" + "=" * 50)
-        print("브리핑 생성 완료!")
+        print(f"브리핑 생성 완료! (총 {time.time()-t_start:.1f}s)")
         print("=" * 50)
 
     except Exception as e:
