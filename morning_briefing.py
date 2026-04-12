@@ -215,6 +215,117 @@ def _strip_html(text):
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# 기사 본문 후보 CSS 선택자 (한국 언론사 공통 패턴)
+_ARTICLE_SELECTORS = [
+    "article",
+    "div#articleBody",
+    "div#article-body",
+    "div#articleBodyContents",
+    "div#newsct_article",
+    "div#dic_area",
+    "div.article_body",
+    "div.article-body",
+    "div.article_view",
+    "div.article-content",
+    "div.news_view",
+    "div.news-body",
+    "div.art_body",
+    "div.view_con",
+    "div.view_content",
+    "section.article",
+    "main",
+]
+
+
+def fetch_article_content(url, timeout=8, max_chars=1500):
+    """기사 URL에서 본문 텍스트를 추출. 실패 시 빈 문자열.
+
+    Google News 리다이렉트 URL의 경우 requests가 HTTP 리다이렉트를 따라가며,
+    최종 기사 페이지의 DOM에서 흔한 본문 컨테이너를 찾아 텍스트를 반환한다.
+    """
+    if not url:
+        return ""
+    try:
+        headers = {
+            "User-Agent": _USER_AGENT,
+            "Accept-Language": "ko,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if resp.status_code != 200 or not resp.text:
+            return ""
+        resp.encoding = resp.encoding or resp.apparent_encoding
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 최종 페이지가 여전히 Google News 리다이렉트면 포기
+        if "news.google.com" in (urlparse(resp.url).netloc or ""):
+            return ""
+
+        # 잡음 요소 제거
+        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "noscript"]):
+            tag.decompose()
+
+        # 본문 후보 중 가장 긴 텍스트 블록 선택
+        best_text = ""
+        for selector in _ARTICLE_SELECTORS:
+            for node in soup.select(selector):
+                text = node.get_text(" ", strip=True)
+                if len(text) > len(best_text):
+                    best_text = text
+
+        # Fallback: <p> 태그 집합
+        if len(best_text) < 200:
+            paragraphs = [
+                p.get_text(" ", strip=True)
+                for p in soup.find_all("p")
+                if len(p.get_text(strip=True)) > 20
+            ]
+            joined = " ".join(paragraphs)
+            if len(joined) > len(best_text):
+                best_text = joined
+
+        best_text = re.sub(r"\s+", " ", best_text).strip()
+        return best_text[:max_chars]
+    except Exception:
+        return ""
+
+
+def enrich_with_content(articles_groups, max_workers=10):
+    """모든 기사(카테고리 dict + self_news 리스트)의 본문을 병렬 fetch하여
+    각 article dict에 "content" 필드를 추가한다.
+
+    articles_groups: list of iterables (카테고리별 list 또는 self_news list)
+    """
+    all_items = []
+    for group in articles_groups:
+        all_items.extend(group)
+
+    if not all_items:
+        return 0
+
+    print(f"  기사 본문 {len(all_items)}건 병렬 수집 중...")
+    success = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_article_content, a["link"]): a for a in all_items}
+        for future in as_completed(futures):
+            article = futures[future]
+            try:
+                content = future.result()
+            except Exception:
+                content = ""
+            if content and len(content) > 150:
+                article["content"] = content
+                success += 1
+    print(f"  본문 수집 성공: {success}/{len(all_items)}건")
+    return success
+
+
 # ──────────────────────────────────────────────
 # 날씨 수집
 # ──────────────────────────────────────────────
@@ -551,14 +662,27 @@ def process_articles(articles, api_key, label="", is_global=False):
     if not articles or not api_key:
         return articles
 
-    numbered = "\n".join(f"{i+1}. {a['title']}" for i, a in enumerate(articles))
+    # 각 기사의 제목 + 본문 일부(있다면)를 프롬프트에 포함
+    def _fmt(i, a):
+        line = f"{i+1}. 제목: {a['title']}"
+        content = a.get("content", "")
+        if content:
+            # 입력 토큰 절약 위해 본문 앞부분만 사용
+            line += f"\n   본문: {content[:700]}"
+        return line
+
+    numbered = "\n\n".join(_fmt(i, a) for i, a in enumerate(articles))
 
     if is_global:
-        prompt = f"""다음은 해외 골프 뉴스 영문 기사 제목 목록입니다.
+        prompt = f"""다음은 해외 골프 뉴스 기사 목록입니다. 각 기사는 제목과 (가능한 경우) 본문 일부가 제공됩니다.
 
 작업:
 (1) 같은 사건/주제를 다룬 기사는 그룹화하여 가장 정보가 풍부한 1개만 남기세요.
-(2) 남긴 기사 각각에 대해 한국어 제목 번역과 국문 요약(1-2문장)을 작성하세요.
+(2) 남긴 기사 각각에 대해:
+    - 한국어 제목 번역을 작성하세요.
+    - 본문에 담긴 구체적 사실(누가·무엇을·어떻게·수치 등)을 한국어 1-2문장으로 요약하세요.
+    - 제목을 말 바꿔 쓰지 말고, 본문에서 얻은 새로운 정보를 드러내세요.
+    - 본문이 없으면 제목에서 유추할 수 있는 맥락을 간결히 제공하세요.
 
 반드시 아래 형식으로만 출력하세요. 설명·머리말·꼬리말 금지:
 ===번호===
@@ -567,17 +691,20 @@ def process_articles(articles, api_key, label="", is_global=False):
 
 {numbered}"""
     else:
-        prompt = f"""다음은 골프 관련 뉴스 기사 제목 목록입니다.
+        prompt = f"""다음은 골프 관련 뉴스 기사 목록입니다. 각 기사는 제목과 (가능한 경우) 본문 일부가 제공됩니다.
 
 작업:
 (1) 같은 사건/주제 기사는 그룹화하여 가장 정보가 풍부하고 구체적인 1개만 남기세요.
-(2) 남긴 기사마다 핵심 내용을 경영진이 이해할 수 있도록 한국어 1문장(40자 이내)으로 요약하세요.
+(2) 남긴 기사마다 **본문에 담긴 구체적 사실**(수치·장소·인물·배경·맥락)을 한국어 1문장(50자 이내)으로 요약하세요.
+    - 제목을 말만 바꿔서 반복하지 마세요. 제목에 없는 정보를 반드시 1개 이상 포함하세요.
+    - 본문이 제공되지 않은 경우에만 제목에서 유추한 핵심을 제공하세요.
+    - 경영진이 기사 전체를 읽지 않고도 본질을 파악할 수 있게 작성하세요.
 
 판단 기준: 같은 프로젝트/사건/대회/제품/주체를 다루면 동일 그룹.
 
 반드시 아래 형식으로만 출력하세요. 설명·머리말·꼬리말 금지:
 ===번호===
-(요약 1문장)
+(본문 기반 요약 1문장)
 
 {numbered}"""
 
@@ -1049,6 +1176,12 @@ def main():
 
         total_articles = sum(len(articles) for articles in news.values()) + len(self_news)
         print(f"  수집 완료: 총 {total_articles}건 ({time.time()-t0:.1f}s)")
+
+        # 2-1. 기사 본문 병렬 수집 (요약 품질 향상을 위해)
+        print("\n[2-1/5] 기사 본문 병렬 수집...")
+        t0 = time.time()
+        enrich_with_content(list(news.values()) + [self_news])
+        print(f"  본문 수집 완료 ({time.time()-t0:.1f}s)")
 
         # 3. AI 처리 (중복 제거 + 요약을 단일 호출에 통합, 카테고리별 병렬)
         print("\n[3/5] AI 중복 제거 + 요약 (병렬)...")
