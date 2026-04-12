@@ -159,6 +159,17 @@ def _normalize_url(url):
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
 
+def _strip_html(text):
+    """HTML 태그 제거 및 공백 정리"""
+    if not text:
+        return ""
+    try:
+        cleaned = BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
+    except Exception:
+        cleaned = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 # ──────────────────────────────────────────────
 # 날씨 수집
 # ──────────────────────────────────────────────
@@ -359,11 +370,16 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
             elif domain:
                 source = domain.replace("www.", "")
 
+            # 요약 추출 (RSS description → HTML 태그 제거)
+            raw_summary = entry.get("summary", "") or entry.get("description", "")
+            summary = _strip_html(raw_summary)[:400]
+
             articles.append({
                 "title": entry.get("title", "제목 없음"),
                 "link": link,
                 "published": published.strftime("%m/%d %H:%M") if published else "",
                 "source": source,
+                "summary": summary,
             })
 
             if len(articles) >= limit:
@@ -605,7 +621,7 @@ def generate_analysis(config, weather_data, news, self_news):
 # HTML 생성
 # ──────────────────────────────────────────────
 
-def _build_news_section(title, icon, articles, bg_color="#ffffff", show_summary=False):
+def _build_news_section(title, icon, articles, bg_color="#ffffff", is_global=False):
     """뉴스 카테고리 HTML 섹션 생성"""
     if not articles:
         return ""
@@ -615,14 +631,27 @@ def _build_news_section(title, icon, articles, bg_color="#ffffff", show_summary=
         source_badge = f'<span style="color:#888;font-size:12px;">{article["source"]}</span>' if article["source"] else ""
         date_badge = f'<span style="color:#aaa;font-size:11px;margin-left:8px;">{article["published"]}</span>' if article["published"] else ""
 
-        # 해외 뉴스: 한국어 제목 + 요약 표시
-        display_title = article.get("title_kr", article["title"]) if show_summary else article["title"]
-        summary_html = ""
-        if show_summary and article.get("summary_kr"):
-            summary_html = f'<div style="color:#555;font-size:13px;margin-top:4px;padding:6px 10px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;">{article["summary_kr"]}</div>'
+        # 해외 뉴스: 한국어 번역 제목 우선
+        display_title = article.get("title_kr", article["title"]) if is_global else article["title"]
+
+        # 원문 제목 (해외 뉴스만)
         original_title = ""
-        if show_summary and article.get("title_kr"):
+        if is_global and article.get("title_kr"):
             original_title = f'<div style="color:#999;font-size:11px;margin-top:2px;">{article["title"]}</div>'
+
+        # 요약: 해외는 AI 요약(summary_kr), 국내는 RSS summary
+        summary_text = ""
+        if is_global:
+            summary_text = article.get("summary_kr", "")
+        else:
+            raw = article.get("summary", "")
+            # 제목과 거의 동일한 요약은 제외
+            if raw and raw[:40].lower() not in article["title"][:60].lower() and len(raw) > 20:
+                summary_text = raw[:150] + ("…" if len(raw) > 150 else "")
+
+        summary_html = ""
+        if summary_text:
+            summary_html = f'<div style="color:#555;font-size:13px;margin-top:4px;padding:6px 10px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;line-height:1.5;">{summary_text}</div>'
 
         rows += f"""
         <tr>
@@ -778,7 +807,7 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
             label = categories_config.get(cat_key, {}).get("label", cat_key)
             icon = icon_map.get(cat_key, "📰")
             is_global = (cat_key == "global")
-            news_sections += _build_news_section(label, icon, news[cat_key], show_summary=is_global)
+            news_sections += _build_news_section(label, icon, news[cat_key], is_global=is_global)
 
     # ── 자사 뉴스 섹션 ──
     self_section = ""
