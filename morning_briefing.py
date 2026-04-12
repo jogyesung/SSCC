@@ -591,6 +591,58 @@ def summarize_global_articles(articles, api_key):
         return articles
 
 
+def dedup_with_ai(articles, api_key, label=""):
+    """Claude Haiku로 같은 사건/주제 기사를 그룹화하고 대표 기사만 남긴다.
+    토큰 매칭으로 잡기 어려운 표현 차이(서로 다른 신문사의 같은 사건)를 제거한다."""
+    if not articles or len(articles) <= 1 or not api_key:
+        return articles
+
+    numbered = "\n".join(f"{i+1}. {a['title']}" for i, a in enumerate(articles))
+    prompt = f"""다음은 골프 관련 뉴스 기사 제목 목록입니다.
+같은 사건/주제를 다루는 기사들을 그룹으로 묶고, 각 그룹에서 가장 대표적인
+(정보가 풍부하고 구체적인) 기사 1개의 번호만 남겨주세요.
+서로 다른 주제라면 각각 독립된 그룹으로 유지하세요.
+
+판단 기준:
+- 같은 프로젝트/사건/대회/제품을 다루면 동일 그룹
+- 표현이 달라도 핵심 내용이 같으면 동일 그룹
+- 장소·대상·주체가 같고 맥락이 같으면 동일 그룹
+
+출력 형식: 남길 기사 번호만 쉼표로 구분 (예: 1,3,5,7)
+설명 없이 번호만 출력하세요.
+
+{numbered}"""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = response.content[0].text.strip()
+
+        keep_indices = set()
+        for part in re.split(r"[,\s]+", result):
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(articles):
+                    keep_indices.add(idx)
+
+        if not keep_indices:
+            return articles
+
+        deduped = [a for i, a in enumerate(articles) if i in keep_indices]
+        removed = len(articles) - len(deduped)
+        if removed > 0:
+            print(f"  [AI 중복제거] {label}: {removed}건 제거 ({len(articles)}→{len(deduped)})")
+        return deduped
+    except Exception as e:
+        print(f"  [AI 중복제거] {label} 실패: {e}")
+        return articles
+
+
 def summarize_korean_articles(articles, api_key, label=""):
     """국내 골프 뉴스 제목을 바탕으로 1문장 국문 요약 생성 (Claude Haiku, 일괄 처리)"""
     if not articles or not api_key:
@@ -1052,6 +1104,17 @@ def main():
         print("\n[4/6] AI 분석 처리...")
         api_key = config.get("claude_api_key", "")
 
+        # AI 기반 중복 제거 (카테고리별)
+        categories_config = config.get("news_categories", {})
+        for cat_key, articles in news.items():
+            if not articles:
+                continue
+            label = categories_config.get(cat_key, {}).get("label", cat_key)
+            news[cat_key] = dedup_with_ai(articles, api_key, label)
+
+        if self_news:
+            self_news = dedup_with_ai(self_news, api_key, "자사 뉴스")
+
         # 해외 뉴스 국문 요약 (제목 번역 + 요약)
         if news.get("global"):
             print("  해외 뉴스 국문 요약 중...")
@@ -1060,7 +1123,6 @@ def main():
             print(f"  해외 뉴스 {summarized}건 요약 완료")
 
         # 국내 뉴스 카테고리별 요약
-        categories_config = config.get("news_categories", {})
         for cat_key, articles in news.items():
             if cat_key == "global" or not articles:
                 continue
