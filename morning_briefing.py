@@ -432,10 +432,14 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
 
         for entry in feed.entries[:limit * 2]:  # 여유분 확보
             # 발행일 파싱
+            # feedparser의 published_parsed는 항상 UTC로 정규화된 time tuple이다.
+            # 반드시 UTC로 해석한 뒤 KST로 변환해야 한다.
             published = None
             if hasattr(entry, "published_parsed") and entry.published_parsed:
                 try:
-                    published = datetime(*entry.published_parsed[:6], tzinfo=KST)
+                    published = datetime(
+                        *entry.published_parsed[:6], tzinfo=timezone.utc
+                    ).astimezone(KST)
                 except Exception:
                     published = now
 
