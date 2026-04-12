@@ -630,21 +630,14 @@ def process_articles(articles, api_key, label="", is_global=False):
 
 {numbered}"""
     else:
+        # 국문 뉴스: 중복 제거만 수행 (요약은 표시하지 않음)
         prompt = f"""다음은 골프 관련 뉴스 기사 목록입니다. 각 기사는 제목과 RSS 본문(또는 "없음")으로 제공됩니다.
 
-작업:
-(1) 같은 사건/주제 기사는 그룹화하여 대표 1개만 남기세요.
-(2) 남긴 기사마다 해당 뉴스가 골프장 경영진에게 **어떤 의미와 영향**을 가지는지 한국어 2문장으로 분석하세요.
-    - 절대 금지: 제목을 말만 바꿔서 반복하는 것.
-    - 반드시 포함: 경영/시장/회원권/운영/경쟁/정책 측면의 시사점이나 배경 맥락.
-    - 본문이 "없음"이면 골프 업계 일반 지식으로 의미를 유추해 작성하세요.
-    - 경영진이 기사 전체를 읽지 않고도 '왜 중요한가'를 파악할 수 있게 쓰세요.
-
+작업: 같은 사건/주제를 다룬 기사는 하나의 그룹으로 묶고, 그룹마다 가장 정보가 풍부한 대표 1개만 남기세요.
 판단 기준: 같은 프로젝트/사건/대회/제품/주체를 다루면 동일 그룹.
 
-반드시 아래 형식으로만 출력하세요. 설명·머리말·꼬리말 금지:
-===번호===
-요약: 의미·영향 분석 2문장
+출력: 남길 기사의 번호만 한 줄에 쉼표로 구분해 출력하세요. 설명·머리말·꼬리말 금지.
+예시: 1,3,5,7
 
 {numbered}"""
 
@@ -652,50 +645,55 @@ def process_articles(articles, api_key, label="", is_global=False):
         client = _get_client(api_key)
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=2048,
+            max_tokens=2048 if is_global else 512,
             messages=[{"role": "user", "content": prompt}],
         )
         result = response.content[0].text.strip()
 
-        # 파서: 태그 단위로 블록을 누적한 뒤 한 번에 파싱 (멀티라인 요약 지원)
         kept = {}
-        current_idx = None
-        current_field = None  # "title_kr" | "summary_kr" | None
-        for raw_line in result.split("\n"):
-            line = raw_line.rstrip()
-            if not line.strip():
-                continue
-            tag_match = re.match(r"\s*===\s*(\d+)\s*===", line)
-            if tag_match:
-                idx = int(tag_match.group(1)) - 1
+        if is_global:
+            # 해외 뉴스: 태그 단위로 블록을 누적 (멀티라인 요약 지원)
+            current_idx = None
+            current_field = None  # "title_kr" | "summary_kr" | None
+            for raw_line in result.split("\n"):
+                line = raw_line.rstrip()
+                if not line.strip():
+                    continue
+                tag_match = re.match(r"\s*===\s*(\d+)\s*===", line)
+                if tag_match:
+                    idx = int(tag_match.group(1)) - 1
+                    if 0 <= idx < len(articles):
+                        current_idx = idx
+                        kept.setdefault(current_idx, {})
+                        current_field = "summary_kr"
+                    else:
+                        current_idx = None
+                        current_field = None
+                    continue
+                if current_idx is None:
+                    continue
+
+                stripped = line.strip()
+                m_title = re.match(r"제목\s*[:：]\s*(.+)", stripped)
+                if m_title:
+                    kept[current_idx]["title_kr"] = m_title.group(1).strip().strip("[]")
+                    current_field = "title_kr_cont"
+                    continue
+                m_summary = re.match(r"요약\s*[:：]\s*(.*)", stripped)
+                if m_summary:
+                    kept[current_idx]["summary_kr"] = m_summary.group(1).strip()
+                    current_field = "summary_kr"
+                    continue
+
+                if current_field == "summary_kr":
+                    prev = kept[current_idx].get("summary_kr", "")
+                    kept[current_idx]["summary_kr"] = (prev + " " + stripped).strip()
+        else:
+            # 국문 뉴스: 남길 번호 리스트만 파싱 ("1,3,5,7")
+            for token in re.findall(r"\d+", result):
+                idx = int(token) - 1
                 if 0 <= idx < len(articles):
-                    current_idx = idx
-                    kept.setdefault(current_idx, {})
-                    current_field = "summary_kr"  # 기본 누적 대상
-                else:
-                    current_idx = None
-                    current_field = None
-                continue
-            if current_idx is None:
-                continue
-
-            stripped = line.strip()
-            m_title = re.match(r"제목\s*[:：]\s*(.+)", stripped)
-            if m_title:
-                kept[current_idx]["title_kr"] = m_title.group(1).strip().strip("[]")
-                current_field = "title_kr_cont"  # 제목은 한 줄만 — 이어지는 행은 요약 시작 전까지 무시
-                continue
-            m_summary = re.match(r"요약\s*[:：]\s*(.*)", stripped)
-            if m_summary:
-                text = m_summary.group(1).strip()
-                kept[current_idx]["summary_kr"] = text
-                current_field = "summary_kr"
-                continue
-
-            # 태그/레이블 없는 본문 라인 → 현재 필드에 이어붙이기
-            if current_field == "summary_kr":
-                prev = kept[current_idx].get("summary_kr", "")
-                kept[current_idx]["summary_kr"] = (prev + " " + stripped).strip()
+                    kept.setdefault(idx, {})
 
         if not kept:
             print(f"  [{label}] AI 응답 파싱 실패, 원본 유지")
@@ -708,10 +706,11 @@ def process_articles(articles, api_key, label="", is_global=False):
             result_articles.append(merged)
 
         removed = len(articles) - len(result_articles)
+        action = "중복 제거 + 의미분석" if is_global else "중복 제거"
         if removed > 0:
-            print(f"  [{label}] 중복 {removed}건 제거 + 요약 완료 ({len(articles)}→{len(result_articles)})")
+            print(f"  [{label}] {action} 완료 ({len(articles)}→{len(result_articles)})")
         else:
-            print(f"  [{label}] 요약 완료 ({len(result_articles)}건)")
+            print(f"  [{label}] {action} 완료 ({len(result_articles)}건)")
         return result_articles
     except Exception as e:
         print(f"  [{label}] AI 처리 실패: {e}")
@@ -807,12 +806,12 @@ def _build_news_section(title, icon, articles, bg_color="#ffffff", is_global=Fal
         if is_global and article.get("title_kr"):
             original_title = f'<div style="color:#999;font-size:11px;margin-top:2px;">{article["title"]}</div>'
 
-        # 요약: AI 생성 요약(summary_kr) 사용
-        summary_text = article.get("summary_kr", "")
-
+        # 요약: 해외 뉴스만 의미·영향 분석을 표시 (국문은 제목만)
         summary_html = ""
-        if summary_text:
-            summary_html = f'<div style="color:#555;font-size:13px;margin-top:3px;padding:4px 8px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;line-height:1.4;">{summary_text}</div>'
+        if is_global:
+            summary_text = article.get("summary_kr", "")
+            if summary_text:
+                summary_html = f'<div style="color:#555;font-size:13px;margin-top:3px;padding:4px 8px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;line-height:1.4;">{summary_text}</div>'
 
         rows += f"""
         <tr>
