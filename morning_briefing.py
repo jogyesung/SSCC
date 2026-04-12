@@ -370,16 +370,11 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
             elif domain:
                 source = domain.replace("www.", "")
 
-            # 요약 추출 (RSS description → HTML 태그 제거)
-            raw_summary = entry.get("summary", "") or entry.get("description", "")
-            summary = _strip_html(raw_summary)[:400]
-
             articles.append({
                 "title": entry.get("title", "제목 없음"),
                 "link": link,
                 "published": published.strftime("%m/%d %H:%M") if published else "",
                 "source": source,
-                "summary": summary,
             })
 
             if len(articles) >= limit:
@@ -558,6 +553,60 @@ def summarize_global_articles(articles, api_key):
         return articles
 
 
+def summarize_korean_articles(articles, api_key, label=""):
+    """국내 골프 뉴스 제목을 바탕으로 1문장 국문 요약 생성 (Claude Haiku, 일괄 처리)"""
+    if not articles or not api_key:
+        return articles
+
+    # 태그 기반 일괄 요청 (claude-project 방식)
+    tagged = "\n".join(f"===T{i+1}===\n{a['title']}" for i, a in enumerate(articles))
+    prompt = f"""다음은 골프 관련 뉴스 기사 제목들입니다.
+각 기사에 대해 제목에서 유추할 수 있는 핵심 내용을 경영진이 한눈에 파악할 수 있도록
+한국어 1문장(40자 이내)으로 요약해주세요.
+
+반드시 ===T숫자=== 태그를 그대로 유지하고, 태그 바로 아래 줄에 요약 1문장만 출력하세요.
+제목을 단순히 반복하지 말고, 핵심 의미를 풀어서 설명해주세요.
+
+{tagged}"""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        result = response.content[0].text.strip()
+
+        # 태그 기반 파싱
+        current_idx = None
+        current_lines = []
+        for line in result.split("\n"):
+            stripped = line.strip()
+            tag_match = re.match(r"===T(\d+)===", stripped)
+            if tag_match:
+                # 이전 항목 저장
+                if current_idx is not None and current_lines:
+                    idx = current_idx - 1
+                    if 0 <= idx < len(articles):
+                        articles[idx]["summary_kr"] = " ".join(current_lines).strip()
+                current_idx = int(tag_match.group(1))
+                current_lines = []
+            elif current_idx is not None and stripped:
+                current_lines.append(stripped)
+
+        # 마지막 항목 저장
+        if current_idx is not None and current_lines:
+            idx = current_idx - 1
+            if 0 <= idx < len(articles):
+                articles[idx]["summary_kr"] = " ".join(current_lines).strip()
+
+        return articles
+    except Exception as e:
+        print(f"[AI] {label} 요약 실패: {e}")
+        return articles
+
+
 def generate_analysis(config, weather_data, news, self_news):
     """경영진 핵심 포인트 생성 (Claude Haiku)"""
     api_key = config.get("claude_api_key", "")
@@ -639,15 +688,8 @@ def _build_news_section(title, icon, articles, bg_color="#ffffff", is_global=Fal
         if is_global and article.get("title_kr"):
             original_title = f'<div style="color:#999;font-size:11px;margin-top:2px;">{article["title"]}</div>'
 
-        # 요약: 해외는 AI 요약(summary_kr), 국내는 RSS summary
-        summary_text = ""
-        if is_global:
-            summary_text = article.get("summary_kr", "")
-        else:
-            raw = article.get("summary", "")
-            # 제목과 거의 동일한 요약은 제외
-            if raw and raw[:40].lower() not in article["title"][:60].lower() and len(raw) > 20:
-                summary_text = raw[:150] + ("…" if len(raw) > 150 else "")
+        # 요약: AI 생성 요약(summary_kr) 사용
+        summary_text = article.get("summary_kr", "")
 
         summary_html = ""
         if summary_text:
@@ -972,26 +1014,36 @@ def main():
         print("\n[4/6] AI 분석 처리...")
         api_key = config.get("claude_api_key", "")
 
-        # 해외 뉴스 국문 요약
+        # 해외 뉴스 국문 요약 (제목 번역 + 요약)
         if news.get("global"):
             print("  해외 뉴스 국문 요약 중...")
             news["global"] = summarize_global_articles(news["global"], api_key)
             summarized = sum(1 for a in news["global"] if a.get("summary_kr"))
             print(f"  해외 뉴스 {summarized}건 요약 완료")
 
-        # 번역 (해외 뉴스 제외 - 이미 요약 처리됨)
-        all_titles = []
+        # 국내 뉴스 카테고리별 요약
+        categories_config = config.get("news_categories", {})
         for cat_key, articles in news.items():
-            if cat_key != "global":
-                all_titles.extend(a["title"] for a in articles)
-        translations = translate_titles(all_titles, api_key)
-        if translations:
-            print(f"  {len(translations)}건 번역 완료")
+            if cat_key == "global" or not articles:
+                continue
+            label = categories_config.get(cat_key, {}).get("label", cat_key)
+            print(f"  {label} 요약 중...")
+            news[cat_key] = summarize_korean_articles(articles, api_key, label)
+            summarized = sum(1 for a in news[cat_key] if a.get("summary_kr"))
+            print(f"  {label} {summarized}건 요약 완료")
+
+        # 자사 뉴스 요약
+        if self_news:
+            print("  자사 뉴스 요약 중...")
+            self_news = summarize_korean_articles(self_news, api_key, "자사 뉴스")
 
         # 분석
         analysis = generate_analysis(config, current_weather, news, self_news)
         if analysis:
             print("  핵심 포인트 생성 완료")
+
+        # translations는 빈 dict로 유지 (요약에 한국어 제목이 이미 포함됨)
+        translations = {}
 
         # 5. HTML 생성
         print("\n[5/6] HTML 브리핑 생성...")
