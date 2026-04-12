@@ -122,30 +122,63 @@ def _is_korean(text):
     return bool(re.search(r"[\uac00-\ud7a3]", text))
 
 
+# 중복 판별 시 제외할 불용어 (너무 흔해서 변별력 없음)
+_STOPWORDS = {
+    "골프", "골프장", "골프리조트", "리조트", "골프업계", "뉴스", "기자", "보도",
+    "특파원", "속보", "단독", "종합", "영상", "사진", "인터뷰", "이슈",
+    "golf", "news", "the", "and", "for", "with", "from", "that", "this",
+    "course", "tour", "pga", "lpga",
+}
+
+
 def _title_tokens(title):
-    """제목에서 비교용 핵심 토큰 추출 (조사/특수문자 제거)"""
-    # 특수문자, 따옴표, 괄호 등 제거
-    cleaned = re.sub(r"[^\w\s]", " ", title)
-    # 소문자 변환 후 토큰 분리, 1글자 제거
-    tokens = set(t.lower() for t in cleaned.split() if len(t) > 1)
+    """제목에서 비교용 핵심 토큰 추출 (불용어 제거)"""
+    # 신문사명 제거 (' - 신문사명' 패턴)
+    cleaned_title = re.sub(r"\s*[-–—]\s*[^-–—]*$", "", title)
+    # 특수문자 제거
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned_title)
+    # 토큰 추출: 2글자 이상, 불용어 제외
+    tokens = set()
+    for t in cleaned.split():
+        t = t.lower()
+        if len(t) >= 2 and t not in _STOPWORDS:
+            tokens.add(t)
     return tokens
 
 
-def _is_similar_title(new_title, existing_titles, threshold=0.5):
-    """기존 제목들과 유사도 비교. threshold 이상 겹치면 중복으로 판단"""
+def _is_similar_title(new_title, existing_titles, threshold=0.3):
+    """기존 제목들과 유사도 비교. threshold 이상 겹치거나
+    핵심 키워드 3개 이상 겹치면 중복으로 판단"""
     new_tokens = _title_tokens(new_title)
-    if not new_tokens:
+    if not new_tokens or len(new_tokens) < 2:
         return False
 
     for existing in existing_titles:
         existing_tokens = _title_tokens(existing)
-        if not existing_tokens:
+        if not existing_tokens or len(existing_tokens) < 2:
             continue
-        # Jaccard 유사도
         intersection = new_tokens & existing_tokens
         union = new_tokens | existing_tokens
-        if len(intersection) / len(union) >= threshold:
+        jaccard = len(intersection) / len(union)
+        # Jaccard 유사도 or 핵심 토큰 3개 이상 공통
+        if jaccard >= threshold or len(intersection) >= 3:
             return True
+    return False
+
+
+def _is_junk_title(title):
+    """쓰레기 기사 제목 필터 (스크린샷, 파일명 등)"""
+    if not title or len(title) < 5:
+        return True
+    # 스크린샷 파일명 패턴
+    if re.match(r"^\s*screenshot", title, re.IGNORECASE):
+        return True
+    # 제목이 타임스탬프로만 구성된 경우
+    if re.match(r"^\s*\d{4}[-./]\d{2}[-./]\d{2}", title):
+        return True
+    # 확장자가 있는 경우 (이미지/문서 파일명)
+    if re.search(r"\.(jpg|jpeg|png|gif|pdf|docx?)(\s|$|-)", title, re.IGNORECASE):
+        return True
     return False
 
 
@@ -363,6 +396,11 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
             if any(bd in domain for bd in blocked_domains):
                 continue
 
+            # 쓰레기 제목 필터 (스크린샷, 파일명 등)
+            title = entry.get("title", "제목 없음")
+            if _is_junk_title(title):
+                continue
+
             # 소스 추출
             source = ""
             if hasattr(entry, "source") and hasattr(entry.source, "title"):
@@ -371,7 +409,7 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
                 source = domain.replace("www.", "")
 
             articles.append({
-                "title": entry.get("title", "제목 없음"),
+                "title": title,
                 "link": link,
                 "published": published.strftime("%m/%d %H:%M") if published else "",
                 "source": source,
@@ -693,25 +731,25 @@ def _build_news_section(title, icon, articles, bg_color="#ffffff", is_global=Fal
 
         summary_html = ""
         if summary_text:
-            summary_html = f'<div style="color:#555;font-size:13px;margin-top:4px;padding:6px 10px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;line-height:1.5;">{summary_text}</div>'
+            summary_html = f'<div style="color:#555;font-size:13px;margin-top:3px;padding:4px 8px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;line-height:1.4;">{summary_text}</div>'
 
         rows += f"""
         <tr>
-          <td style="padding:8px 16px;border-bottom:1px solid #f0f0f0;font-size:14px;line-height:1.6;">
+          <td style="padding:6px 14px;border-bottom:1px solid #f0f0f0;font-size:14px;line-height:1.4;">
             <a href="{article['link']}" style="color:#1a1a1a;text-decoration:none;" target="_blank">{display_title}</a>
             {original_title}
             {summary_html}
-            <br>{source_badge}{date_badge}
+            <div style="margin-top:2px;">{source_badge}{date_badge}</div>
           </td>
         </tr>"""
 
     return f"""
-    <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="margin-bottom:16px;border-radius:8px;overflow:hidden;">
+    <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="margin-bottom:10px;border-radius:8px;overflow:hidden;">
       <tr>
         <td bgcolor="{bg_color}" style="padding:0;">
           <table width="100%" cellpadding="0" cellspacing="0" border="0">
             <tr>
-              <td style="padding:16px;font-size:18px;font-weight:bold;color:#1a5632;border-bottom:2px solid #e8f5e9;">
+              <td style="padding:10px 14px;font-size:17px;font-weight:bold;color:#1a5632;border-bottom:2px solid #e8f5e9;">
                 {icon} {title}
                 <span style="font-size:13px;color:#888;font-weight:normal;margin-left:8px;">{len(articles)}건</span>
               </td>
@@ -749,18 +787,18 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
         }.get(playability, "#666")
 
         weather_section = f"""
-    <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="margin-bottom:16px;border-radius:8px;overflow:hidden;">
+    <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="margin-bottom:10px;border-radius:8px;overflow:hidden;">
       <tr>
         <td bgcolor="#ffffff" style="padding:0;">
           <table width="100%" cellpadding="0" cellspacing="0" border="0">
             <tr>
-              <td style="padding:16px;font-size:18px;font-weight:bold;color:#1a5632;border-bottom:2px solid #e8f5e9;">
+              <td style="padding:10px 14px;font-size:17px;font-weight:bold;color:#1a5632;border-bottom:2px solid #e8f5e9;">
                 🌤️ 오늘의 날씨 — {golf['location']}
               </td>
             </tr>
             <tr>
-              <td style="padding:16px;">
-                <table width="100%" cellpadding="8" cellspacing="0" border="0">
+              <td style="padding:10px 14px;">
+                <table width="100%" cellpadding="4" cellspacing="0" border="0">
                   <tr>
                     <td style="font-size:14px;width:50%;">
                       <b>현재 기온:</b> {current_weather['temp']}°C (체감 {current_weather['feels_like']}°C)<br>
@@ -784,9 +822,9 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
             for day in forecast:
                 rain_color = "#c62828" if day["rain_prob"] > 50 else "#f9a825" if day["rain_prob"] > 30 else "#2e7d32"
                 forecast_rows += f"""
-                  <td align="center" style="padding:8px;font-size:13px;border-right:1px solid #f0f0f0;">
+                  <td align="center" style="padding:6px 4px;font-size:12px;border-right:1px solid #f0f0f0;line-height:1.4;">
                     <b>{day['date']} ({day['weekday']})</b><br>
-                    <span style="font-size:20px;">{day['icon']}</span><br>
+                    <span style="font-size:18px;">{day['icon']}</span><br>
                     {day['high']}° / {day['low']}°<br>
                     <span style="color:{rain_color};">강수 {day['rain_prob']}%</span><br>
                     바람 {day['wind']}m/s
@@ -794,10 +832,10 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
 
             weather_section += f"""
             <tr>
-              <td style="padding:0 16px 16px;">
+              <td style="padding:0 14px 10px;">
                 <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-top:1px solid #e8f5e9;">
                   <tr>
-                    <td style="padding:12px 0 4px;font-size:14px;font-weight:bold;color:#555;">📅 주간 예보</td>
+                    <td style="padding:8px 0 2px;font-size:14px;font-weight:bold;color:#555;">📅 주간 예보</td>
                   </tr>
                   <tr>{forecast_rows}</tr>
                 </table>
@@ -814,17 +852,17 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
     analysis_section = ""
     if analysis:
         analysis_section = f"""
-    <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="margin-bottom:16px;border-radius:8px;overflow:hidden;">
+    <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="margin-bottom:10px;border-radius:8px;overflow:hidden;">
       <tr>
         <td bgcolor="#f0f7f2" style="padding:0;">
           <table width="100%" cellpadding="0" cellspacing="0" border="0">
             <tr>
-              <td style="padding:16px;font-size:18px;font-weight:bold;color:#1a5632;border-bottom:2px solid #c8e6c9;">
+              <td style="padding:10px 14px;font-size:17px;font-weight:bold;color:#1a5632;border-bottom:2px solid #c8e6c9;">
                 📋 오늘의 핵심 포인트
               </td>
             </tr>
             <tr>
-              <td style="padding:16px;font-size:14px;line-height:1.8;">
+              <td style="padding:10px 14px;font-size:14px;line-height:1.55;">
                 <ul style="margin:0;padding-left:20px;">
                   {analysis}
                 </ul>
@@ -869,13 +907,13 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
 <body style="margin:0;padding:0;background-color:#f5f5f0;font-family:'Malgun Gothic','맑은 고딕',sans-serif;">
 
   <!-- 헤더 -->
-  <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="margin-top:20px;border-radius:8px 8px 0 0;overflow:hidden;">
+  <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="margin-top:12px;border-radius:8px 8px 0 0;overflow:hidden;">
     <tr>
-      <td bgcolor="#1a5632" style="padding:24px 20px;text-align:center;">
-        <div style="font-size:24px;font-weight:bold;color:#ffffff;letter-spacing:1px;">
+      <td bgcolor="#1a5632" style="padding:16px 20px;text-align:center;">
+        <div style="font-size:22px;font-weight:bold;color:#ffffff;letter-spacing:1px;">
           ⛳ {golf['name']} 모닝브리핑
         </div>
-        <div style="font-size:14px;color:#a5d6a7;margin-top:8px;">
+        <div style="font-size:13px;color:#a5d6a7;margin-top:4px;">
           {date_str} ({weekday}) | {golf['location']}
         </div>
       </td>
@@ -885,7 +923,7 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
   <!-- 본문 -->
   <table width="700" cellpadding="0" cellspacing="0" border="0" align="center">
     <tr>
-      <td style="padding:16px 0;">
+      <td style="padding:10px 0 4px;">
         {weather_section}
         {analysis_section}
         {news_sections}
@@ -895,13 +933,13 @@ def generate_briefing(config, current_weather, forecast, news, self_news, analys
   </table>
 
   <!-- 푸터 -->
-  <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="border-radius:0 0 8px 8px;overflow:hidden;margin-bottom:20px;">
+  <table width="700" cellpadding="0" cellspacing="0" border="0" align="center" style="border-radius:0 0 8px 8px;overflow:hidden;margin-bottom:12px;">
     <tr>
-      <td bgcolor="#1a5632" style="padding:16px 20px;text-align:center;">
+      <td bgcolor="#1a5632" style="padding:10px 20px;text-align:center;">
         <div style="font-size:12px;color:#a5d6a7;">
           본 브리핑은 {golf['name']} 경영진을 위해 자동 생성되었습니다.
         </div>
-        <div style="font-size:11px;color:#81c784;margin-top:4px;">
+        <div style="font-size:11px;color:#81c784;margin-top:2px;">
           Powered by {golf['name_en']} Briefing System
         </div>
       </td>
