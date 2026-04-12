@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from urllib.parse import quote, urlparse, parse_qs, urlencode
+from urllib.parse import quote, urlparse
 
 import anthropic
 import feedparser
@@ -215,211 +215,45 @@ def _strip_html(text):
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
+def _extract_rss_content(entry, title, max_chars=300):
+    """RSS entry에서 본문 요약을 추출한다.
 
-# 기사 본문 후보 CSS 선택자 (한국 언론사 공통 패턴)
-_ARTICLE_SELECTORS = [
-    "article",
-    "div#articleBody",
-    "div#article-body",
-    "div#articleBodyContents",
-    "div#newsct_article",
-    "div#dic_area",
-    "div.article_body",
-    "div.article-body",
-    "div.article_view",
-    "div.article-content",
-    "div.news_view",
-    "div.news-body",
-    "div.art_body",
-    "div.view_con",
-    "div.view_content",
-    "section.article",
-    "main",
-]
-
-_GN_BATCH_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je"
-
-
-def _resolve_google_news_url(url, timeout=8):
-    """Google News RSS URL을 실제 퍼블리셔 기사 URL로 변환한다.
-
-    Google News RSS의 기사 링크는 news.google.com/rss/articles/<id> 형태의
-    스플래시 URL이며, JavaScript로 실제 기사로 리다이렉트되기 때문에
-    일반적인 HTTP 요청으로는 실제 URL에 도달할 수 없다. 이 함수는
-    googlenewsdecoder 방식을 사용해:
-      1) 스플래시 페이지에서 signature / timestamp 추출
-      2) Google의 batchexecute API를 호출해 실제 URL 획득
-
-    실패 시 원본 URL을 그대로 반환한다.
+    Google News RSS는 summary가 <a>제목</a> - 언론사 형식이라 제목 반복에 불과하다.
+    이 경우 ''을 반환하여 process_articles가 "본문 없음"으로 인식하도록 한다.
+    그 외 피드는 HTML 태그를 제거한 평문을 max_chars까지 반환한다.
     """
-    if not url or "news.google.com" not in url:
-        return url
-    try:
-        parsed = urlparse(url)
-        path_parts = [p for p in parsed.path.split("/") if p]
-        article_id = None
-        for i, part in enumerate(path_parts):
-            if part in ("articles", "read") and i + 1 < len(path_parts):
-                article_id = path_parts[i + 1]
-                break
-        if not article_id:
-            return url
-
-        headers = {"User-Agent": _USER_AGENT}
-
-        # 1단계: 스플래시 페이지에서 signature / timestamp 추출
-        splash_url = f"https://news.google.com/rss/articles/{article_id}"
-        resp = requests.get(splash_url, headers=headers, timeout=timeout)
-        if resp.status_code != 200:
-            return url
-
-        sig_match = re.search(r'data-n-a-sg="([^"]+)"', resp.text)
-        ts_match = re.search(r'data-n-a-ts="([^"]+)"', resp.text)
-        if not sig_match or not ts_match:
-            return url
-        signature = sig_match.group(1)
+    raw = ""
+    if hasattr(entry, "summary") and entry.summary:
+        raw = entry.summary
+    elif hasattr(entry, "description") and entry.description:
+        raw = entry.description
+    elif hasattr(entry, "content") and entry.content:
         try:
-            timestamp = int(ts_match.group(1))
-        except ValueError:
-            return url
+            raw = entry.content[0].value
+        except Exception:
+            raw = ""
 
-        # 2단계: batchexecute payload 구성
-        inner = [
-            "garturlreq",
-            [
-                ["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
-                "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0,
-            ],
-            article_id,
-            timestamp,
-            signature,
-        ]
-        inner_str = json.dumps(inner, separators=(",", ":"))
-        outer = [[["Fbv4je", inner_str, None, "generic"]]]
-        payload = f"f.req={json.dumps(outer, separators=(',', ':'))}"
-
-        # 3단계: batchexecute 호출
-        post_resp = requests.post(
-            _GN_BATCH_URL,
-            data=payload,
-            headers={
-                "User-Agent": _USER_AGENT,
-                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            },
-            timeout=timeout,
-        )
-        if post_resp.status_code != 200:
-            return url
-
-        # 4단계: 응답에서 첫 번째 외부 URL 추출 (google.com은 제외)
-        candidates = re.findall(r'"(https?:[^"]+)"', post_resp.text)
-        for candidate in candidates:
-            candidate = (
-                candidate.replace("\\u003d", "=")
-                .replace("\\u0026", "&")
-                .replace("\\/", "/")
-            )
-            host = urlparse(candidate).netloc.lower()
-            if host and "google.com" not in host and "gstatic.com" not in host:
-                return candidate
-        return url
-    except Exception:
-        return url
-
-
-def fetch_article_content(url, timeout=8, max_chars=1500):
-    """기사 URL에서 본문 텍스트를 추출. 실패 시 빈 문자열.
-
-    Google News URL인 경우 먼저 _resolve_google_news_url로 실제 퍼블리셔
-    URL을 얻은 뒤 해당 페이지의 DOM에서 흔한 본문 컨테이너를 찾아 텍스트를 반환한다.
-    """
-    if not url:
-        return ""
-    try:
-        # Google News 스플래시 URL이면 실제 기사 URL로 해결
-        if "news.google.com" in url:
-            resolved = _resolve_google_news_url(url, timeout=timeout)
-            if not resolved or "news.google.com" in resolved:
-                return ""
-            url = resolved
-
-        headers = {
-            "User-Agent": _USER_AGENT,
-            "Accept-Language": "ko,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml",
-        }
-        resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        if resp.status_code != 200 or not resp.text:
-            return ""
-        resp.encoding = resp.encoding or resp.apparent_encoding
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # 최종 페이지가 여전히 Google News면 포기
-        if "news.google.com" in (urlparse(resp.url).netloc or ""):
-            return ""
-
-        # 잡음 요소 제거
-        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "noscript"]):
-            tag.decompose()
-
-        # 본문 후보 중 가장 긴 텍스트 블록 선택
-        best_text = ""
-        for selector in _ARTICLE_SELECTORS:
-            for node in soup.select(selector):
-                text = node.get_text(" ", strip=True)
-                if len(text) > len(best_text):
-                    best_text = text
-
-        # Fallback: <p> 태그 집합
-        if len(best_text) < 200:
-            paragraphs = [
-                p.get_text(" ", strip=True)
-                for p in soup.find_all("p")
-                if len(p.get_text(strip=True)) > 20
-            ]
-            joined = " ".join(paragraphs)
-            if len(joined) > len(best_text):
-                best_text = joined
-
-        best_text = re.sub(r"\s+", " ", best_text).strip()
-        return best_text[:max_chars]
-    except Exception:
+    if not raw:
         return ""
 
+    text = _strip_html(raw)
+    if not text:
+        return ""
 
-def enrich_with_content(articles_groups, max_workers=10):
-    """모든 기사(카테고리 dict + self_news 리스트)의 본문을 병렬 fetch하여
-    각 article dict에 "content" 필드를 추가한다.
+    # Google News 패턴: "제목 - 언론사" 또는 "제목 언론사"
+    title_clean = re.sub(r"\s+", " ", title).strip()
+    text_clean = re.sub(r"\s+", " ", text).strip()
+    # 내용이 제목과 거의 같으면 (차이 50자 이내) 제목 반복으로 간주
+    if title_clean and text_clean.startswith(title_clean[:20]):
+        remainder = text_clean[len(title_clean):].strip(" -–—·|,.")
+        # 남은 텍스트가 짧으면(언론사명 정도) 버림
+        if len(remainder) < 30:
+            return ""
+    # 제목이 본문 내에 포함되고 본문이 너무 짧으면 버림
+    if len(text_clean) < 50:
+        return ""
 
-    articles_groups: list of iterables (카테고리별 list 또는 self_news list)
-    """
-    all_items = []
-    for group in articles_groups:
-        all_items.extend(group)
-
-    if not all_items:
-        return 0
-
-    print(f"  기사 본문 {len(all_items)}건 병렬 수집 중...")
-    success = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_article_content, a["link"]): a for a in all_items}
-        for future in as_completed(futures):
-            article = futures[future]
-            try:
-                content = future.result()
-            except Exception:
-                content = ""
-            if content and len(content) > 150:
-                article["content"] = content
-                success += 1
-    print(f"  본문 수집 성공: {success}/{len(all_items)}건")
-    return success
+    return text_clean[:max_chars]
 
 
 # ──────────────────────────────────────────────
@@ -627,11 +461,15 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
             elif domain:
                 source = domain.replace("www.", "")
 
+            # RSS 요약 본문 추출 (Google News 제목 반복 패턴은 자동 필터)
+            content = _extract_rss_content(entry, title)
+
             articles.append({
                 "title": title,
                 "link": link,
                 "published": published.strftime("%m/%d %H:%M") if published else "",
                 "source": source,
+                "content": content,
             })
 
             if len(articles) >= limit:
@@ -753,54 +591,53 @@ def collect_golf_course_news(config):
 # ──────────────────────────────────────────────
 
 def process_articles(articles, api_key, label="", is_global=False):
-    """단일 Claude Haiku 호출로 중복 제거 + 요약(+해외 제목 번역)을 일괄 수행.
-    이전 dedup_with_ai + summarize_korean_articles + summarize_global_articles를 통합한 함수."""
+    """단일 Claude Haiku 호출로 중복 제거 + 의미/영향 분석(+해외 제목 번역)을 일괄 수행.
+
+    핵심 원칙: 기사 제목을 바꿔쓰는 '요약'이 아닌, 골프 업계 맥락에서
+    해당 뉴스가 가지는 **의미와 영향**을 분석하도록 지시한다.
+    RSS 본문이 있으면 함께 전달하고, 없으면 모델이 업계 맥락을 활용해 유추한다."""
     if not articles or not api_key:
         return articles
 
-    # 각 기사의 제목 + 본문 일부(있다면)를 프롬프트에 포함
+    # 각 기사의 제목 + RSS 본문(있다면)을 프롬프트에 포함
     def _fmt(i, a):
         line = f"{i+1}. 제목: {a['title']}"
         content = a.get("content", "")
         if content:
-            # 입력 토큰 절약 위해 본문 앞부분만 사용
-            line += f"\n   본문: {content[:700]}"
+            line += f"\n   본문: {content[:300]}"
+        else:
+            line += "\n   본문: (없음 — 업계 맥락에서 의미 유추)"
         return line
 
     numbered = "\n\n".join(_fmt(i, a) for i, a in enumerate(articles))
 
     if is_global:
-        prompt = f"""다음은 해외 골프 뉴스 기사 목록입니다. 각 기사는 제목과 (가능한 경우) 본문 일부가 제공됩니다.
+        prompt = f"""다음은 해외 골프 뉴스 기사 목록입니다. 각 기사는 제목과 RSS 본문(또는 "없음")으로 제공됩니다.
 
 작업:
-(1) 같은 사건/주제를 다룬 기사는 그룹화하여 가장 정보가 풍부한 1개만 남기세요.
+(1) 같은 사건/주제를 다룬 기사는 그룹화하여 대표 1개만 남기세요.
 (2) 남긴 기사 각각에 대해:
-    - 한국어 제목 번역을 작성하세요.
-    - 본문에 담긴 구체적 사실(누가·무엇을·어떻게·수치 등)을 한국어 1-2문장으로 요약하세요.
-    - 제목을 말 바꿔 쓰지 말고, 본문에서 얻은 새로운 정보를 드러내세요.
-    - 본문이 없으면 제목에서 유추할 수 있는 맥락을 간결히 제공하세요.
+    - 제목의 한국어 번역을 작성하세요.
+    - 해당 뉴스가 골프 산업/사우스스프링스 같은 골프장 경영진에게 **어떤 의미와 영향**을 가지는지 한국어 2문장으로 분석하세요.
+    - 절대 금지: 제목을 한국어로 단순 반복하거나 말만 바꿔 쓰는 것.
+    - 반드시 포함: 뉴스가 시장/경쟁/트렌드/운영에 주는 시사점, 또는 배경·맥락.
+    - 본문이 "없음"이면 골프 업계 일반 지식으로 의미를 유추해 작성하세요.
 
 반드시 아래 형식으로만 출력하세요. 설명·머리말·꼬리말 금지:
 ===번호===
 제목: 한국어 제목 번역
-요약: 국문 요약 1-2문장
+요약: 의미·영향 분석 2문장
 
 {numbered}"""
     else:
-        prompt = f"""다음은 골프 관련 뉴스 기사 목록입니다. 각 기사는 제목과 (가능한 경우) 본문 일부가 제공됩니다.
+        # 국문 뉴스: 중복 제거만 수행 (요약은 표시하지 않음)
+        prompt = f"""다음은 골프 관련 뉴스 기사 목록입니다. 각 기사는 제목과 RSS 본문(또는 "없음")으로 제공됩니다.
 
-작업:
-(1) 같은 사건/주제 기사는 그룹화하여 가장 정보가 풍부하고 구체적인 1개만 남기세요.
-(2) 남긴 기사마다 **본문에 담긴 구체적 사실**(수치·장소·인물·배경·맥락)을 한국어 1문장(50자 이내)으로 요약하세요.
-    - 제목을 말만 바꿔서 반복하지 마세요. 제목에 없는 정보를 반드시 1개 이상 포함하세요.
-    - 본문이 제공되지 않은 경우에만 제목에서 유추한 핵심을 제공하세요.
-    - 경영진이 기사 전체를 읽지 않고도 본질을 파악할 수 있게 작성하세요.
-
+작업: 같은 사건/주제를 다룬 기사는 하나의 그룹으로 묶고, 그룹마다 가장 정보가 풍부한 대표 1개만 남기세요.
 판단 기준: 같은 프로젝트/사건/대회/제품/주체를 다루면 동일 그룹.
 
-반드시 아래 형식으로만 출력하세요. 설명·머리말·꼬리말 금지:
-===번호===
-(본문 기반 요약 1문장)
+출력: 남길 기사의 번호만 한 줄에 쉼표로 구분해 출력하세요. 설명·머리말·꼬리말 금지.
+예시: 1,3,5,7
 
 {numbered}"""
 
@@ -808,40 +645,55 @@ def process_articles(articles, api_key, label="", is_global=False):
         client = _get_client(api_key)
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=2048,
+            max_tokens=2048 if is_global else 512,
             messages=[{"role": "user", "content": prompt}],
         )
         result = response.content[0].text.strip()
 
         kept = {}
-        current_idx = None
-        for raw_line in result.split("\n"):
-            line = raw_line.strip()
-            if not line:
-                continue
-            tag_match = re.match(r"===\s*(\d+)\s*===", line)
-            if tag_match:
-                idx = int(tag_match.group(1)) - 1
+        if is_global:
+            # 해외 뉴스: 태그 단위로 블록을 누적 (멀티라인 요약 지원)
+            current_idx = None
+            current_field = None  # "title_kr" | "summary_kr" | None
+            for raw_line in result.split("\n"):
+                line = raw_line.rstrip()
+                if not line.strip():
+                    continue
+                tag_match = re.match(r"\s*===\s*(\d+)\s*===", line)
+                if tag_match:
+                    idx = int(tag_match.group(1)) - 1
+                    if 0 <= idx < len(articles):
+                        current_idx = idx
+                        kept.setdefault(current_idx, {})
+                        current_field = "summary_kr"
+                    else:
+                        current_idx = None
+                        current_field = None
+                    continue
+                if current_idx is None:
+                    continue
+
+                stripped = line.strip()
+                m_title = re.match(r"제목\s*[:：]\s*(.+)", stripped)
+                if m_title:
+                    kept[current_idx]["title_kr"] = m_title.group(1).strip().strip("[]")
+                    current_field = "title_kr_cont"
+                    continue
+                m_summary = re.match(r"요약\s*[:：]\s*(.*)", stripped)
+                if m_summary:
+                    kept[current_idx]["summary_kr"] = m_summary.group(1).strip()
+                    current_field = "summary_kr"
+                    continue
+
+                if current_field == "summary_kr":
+                    prev = kept[current_idx].get("summary_kr", "")
+                    kept[current_idx]["summary_kr"] = (prev + " " + stripped).strip()
+        else:
+            # 국문 뉴스: 남길 번호 리스트만 파싱 ("1,3,5,7")
+            for token in re.findall(r"\d+", result):
+                idx = int(token) - 1
                 if 0 <= idx < len(articles):
-                    current_idx = idx
-                    kept.setdefault(current_idx, {})
-                else:
-                    current_idx = None
-                continue
-            if current_idx is None:
-                continue
-            if is_global:
-                m = re.match(r"제목\s*[:：]\s*(.+)", line)
-                if m:
-                    kept[current_idx]["title_kr"] = m.group(1).strip().strip("[]")
-                    continue
-                m = re.match(r"요약\s*[:：]\s*(.+)", line)
-                if m:
-                    kept[current_idx]["summary_kr"] = m.group(1).strip()
-                    continue
-            else:
-                if "summary_kr" not in kept[current_idx]:
-                    kept[current_idx]["summary_kr"] = line
+                    kept.setdefault(idx, {})
 
         if not kept:
             print(f"  [{label}] AI 응답 파싱 실패, 원본 유지")
@@ -854,10 +706,11 @@ def process_articles(articles, api_key, label="", is_global=False):
             result_articles.append(merged)
 
         removed = len(articles) - len(result_articles)
+        action = "중복 제거 + 의미분석" if is_global else "중복 제거"
         if removed > 0:
-            print(f"  [{label}] 중복 {removed}건 제거 + 요약 완료 ({len(articles)}→{len(result_articles)})")
+            print(f"  [{label}] {action} 완료 ({len(articles)}→{len(result_articles)})")
         else:
-            print(f"  [{label}] 요약 완료 ({len(result_articles)}건)")
+            print(f"  [{label}] {action} 완료 ({len(result_articles)}건)")
         return result_articles
     except Exception as e:
         print(f"  [{label}] AI 처리 실패: {e}")
@@ -953,12 +806,12 @@ def _build_news_section(title, icon, articles, bg_color="#ffffff", is_global=Fal
         if is_global and article.get("title_kr"):
             original_title = f'<div style="color:#999;font-size:11px;margin-top:2px;">{article["title"]}</div>'
 
-        # 요약: AI 생성 요약(summary_kr) 사용
-        summary_text = article.get("summary_kr", "")
-
+        # 요약: 해외 뉴스만 의미·영향 분석을 표시 (국문은 제목만)
         summary_html = ""
-        if summary_text:
-            summary_html = f'<div style="color:#555;font-size:13px;margin-top:3px;padding:4px 8px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;line-height:1.4;">{summary_text}</div>'
+        if is_global:
+            summary_text = article.get("summary_kr", "")
+            if summary_text:
+                summary_html = f'<div style="color:#555;font-size:13px;margin-top:3px;padding:4px 8px;background:#f8f9fa;border-left:3px solid #1a5632;border-radius:2px;line-height:1.4;">{summary_text}</div>'
 
         rows += f"""
         <tr>
@@ -1273,14 +1126,8 @@ def main():
         total_articles = sum(len(articles) for articles in news.values()) + len(self_news)
         print(f"  수집 완료: 총 {total_articles}건 ({time.time()-t0:.1f}s)")
 
-        # 2-1. 기사 본문 병렬 수집 (요약 품질 향상을 위해)
-        print("\n[2-1/5] 기사 본문 병렬 수집...")
-        t0 = time.time()
-        enrich_with_content(list(news.values()) + [self_news])
-        print(f"  본문 수집 완료 ({time.time()-t0:.1f}s)")
-
-        # 3. AI 처리 (중복 제거 + 요약을 단일 호출에 통합, 카테고리별 병렬)
-        print("\n[3/5] AI 중복 제거 + 요약 (병렬)...")
+        # 3. AI 처리 (중복 제거 + 의미·영향 분석을 단일 호출에 통합, 카테고리별 병렬)
+        print("\n[3/5] AI 중복 제거 + 의미/영향 분석 (병렬)...")
         t0 = time.time()
         api_key = config.get("claude_api_key", "")
         categories_config = config.get("news_categories", {})
