@@ -241,16 +241,112 @@ _ARTICLE_SELECTORS = [
     "main",
 ]
 
+_GN_BATCH_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je"
+
+
+def _resolve_google_news_url(url, timeout=8):
+    """Google News RSS URL을 실제 퍼블리셔 기사 URL로 변환한다.
+
+    Google News RSS의 기사 링크는 news.google.com/rss/articles/<id> 형태의
+    스플래시 URL이며, JavaScript로 실제 기사로 리다이렉트되기 때문에
+    일반적인 HTTP 요청으로는 실제 URL에 도달할 수 없다. 이 함수는
+    googlenewsdecoder 방식을 사용해:
+      1) 스플래시 페이지에서 signature / timestamp 추출
+      2) Google의 batchexecute API를 호출해 실제 URL 획득
+
+    실패 시 원본 URL을 그대로 반환한다.
+    """
+    if not url or "news.google.com" not in url:
+        return url
+    try:
+        parsed = urlparse(url)
+        path_parts = [p for p in parsed.path.split("/") if p]
+        article_id = None
+        for i, part in enumerate(path_parts):
+            if part in ("articles", "read") and i + 1 < len(path_parts):
+                article_id = path_parts[i + 1]
+                break
+        if not article_id:
+            return url
+
+        headers = {"User-Agent": _USER_AGENT}
+
+        # 1단계: 스플래시 페이지에서 signature / timestamp 추출
+        splash_url = f"https://news.google.com/rss/articles/{article_id}"
+        resp = requests.get(splash_url, headers=headers, timeout=timeout)
+        if resp.status_code != 200:
+            return url
+
+        sig_match = re.search(r'data-n-a-sg="([^"]+)"', resp.text)
+        ts_match = re.search(r'data-n-a-ts="([^"]+)"', resp.text)
+        if not sig_match or not ts_match:
+            return url
+        signature = sig_match.group(1)
+        try:
+            timestamp = int(ts_match.group(1))
+        except ValueError:
+            return url
+
+        # 2단계: batchexecute payload 구성
+        inner = [
+            "garturlreq",
+            [
+                ["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
+                "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0,
+            ],
+            article_id,
+            timestamp,
+            signature,
+        ]
+        inner_str = json.dumps(inner, separators=(",", ":"))
+        outer = [[["Fbv4je", inner_str, None, "generic"]]]
+        payload = f"f.req={json.dumps(outer, separators=(',', ':'))}"
+
+        # 3단계: batchexecute 호출
+        post_resp = requests.post(
+            _GN_BATCH_URL,
+            data=payload,
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            },
+            timeout=timeout,
+        )
+        if post_resp.status_code != 200:
+            return url
+
+        # 4단계: 응답에서 첫 번째 외부 URL 추출 (google.com은 제외)
+        candidates = re.findall(r'"(https?:[^"]+)"', post_resp.text)
+        for candidate in candidates:
+            candidate = (
+                candidate.replace("\\u003d", "=")
+                .replace("\\u0026", "&")
+                .replace("\\/", "/")
+            )
+            host = urlparse(candidate).netloc.lower()
+            if host and "google.com" not in host and "gstatic.com" not in host:
+                return candidate
+        return url
+    except Exception:
+        return url
+
 
 def fetch_article_content(url, timeout=8, max_chars=1500):
     """기사 URL에서 본문 텍스트를 추출. 실패 시 빈 문자열.
 
-    Google News 리다이렉트 URL의 경우 requests가 HTTP 리다이렉트를 따라가며,
-    최종 기사 페이지의 DOM에서 흔한 본문 컨테이너를 찾아 텍스트를 반환한다.
+    Google News URL인 경우 먼저 _resolve_google_news_url로 실제 퍼블리셔
+    URL을 얻은 뒤 해당 페이지의 DOM에서 흔한 본문 컨테이너를 찾아 텍스트를 반환한다.
     """
     if not url:
         return ""
     try:
+        # Google News 스플래시 URL이면 실제 기사 URL로 해결
+        if "news.google.com" in url:
+            resolved = _resolve_google_news_url(url, timeout=timeout)
+            if not resolved or "news.google.com" in resolved:
+                return ""
+            url = resolved
+
         headers = {
             "User-Agent": _USER_AGENT,
             "Accept-Language": "ko,en;q=0.9",
@@ -263,7 +359,7 @@ def fetch_article_content(url, timeout=8, max_chars=1500):
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 최종 페이지가 여전히 Google News 리다이렉트면 포기
+        # 최종 페이지가 여전히 Google News면 포기
         if "news.google.com" in (urlparse(resp.url).netloc or ""):
             return ""
 
