@@ -118,15 +118,22 @@ def load_config():
         },
     })
     config.setdefault("max_articles_per_category", 8)
-    config.setdefault("max_age_days", 2)
+    config.setdefault("max_age_days", 1)  # 최근 24시간 이내 기사만
     config.setdefault("blocked_domains", ["pinterest.com", "youtube.com"])
 
     return config
 
 
-def _gn(query, hl="ko", gl="KR"):
-    """Google News RSS URL 생성"""
-    return f"https://news.google.com/rss/search?q={quote(query)}&hl={hl}&gl={gl}&ceid={gl}:{hl}"
+def _gn(query, hl="ko", gl="KR", when="1d"):
+    """Google News RSS URL 생성.
+
+    Google News 검색은 기본적으로 '관련성' 순 정렬이라 며칠 전 유명 기사가
+    위로 올라올 수 있다. `when:1d` 연산자를 붙여 최근 24시간 이내 기사만
+    가져오도록 제약한다. 새벽/이른 아침 실행 시 결과가 너무 적으면
+    호출부에서 when을 "2d" 등으로 완화할 수 있다.
+    """
+    q = f"{query} when:{when}" if when else query
+    return f"https://news.google.com/rss/search?q={quote(q)}&hl={hl}&gl={gl}&ceid={gl}:{hl}"
 
 
 def _is_korean(text):
@@ -417,7 +424,12 @@ def format_golf_weather(current, forecast):
 # ──────────────────────────────────────────────
 
 def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
-    """RSS 피드 수집 및 필터링"""
+    """RSS 피드 수집 + 필터링 + 발행일 내림차순 정렬.
+
+    Google News 검색 RSS는 관련성 순 정렬이라 며칠 전 기사가 위에 올 수 있다.
+    따라서 feed.entries를 최대한 읽어 들인 뒤 필터링하고, 마지막에
+    발행일 desc로 정렬해 최신 기사가 상위에 오도록 한다.
+    """
     blocked_domains = blocked_domains or []
     articles = []
 
@@ -430,12 +442,17 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
         now = datetime.now(tz=KST)
         cutoff = now - timedelta(days=max_age_days)
 
-        for entry in feed.entries[:limit * 2]:  # 여유분 확보
+        # 관련성 정렬을 보정하기 위해 더 많이 읽어 들인다
+        for entry in feed.entries[:max(30, limit * 4)]:
             # 발행일 파싱
+            # feedparser의 published_parsed는 항상 UTC로 정규화된 time tuple이다.
+            # 반드시 UTC로 해석한 뒤 KST로 변환해야 한다.
             published = None
             if hasattr(entry, "published_parsed") and entry.published_parsed:
                 try:
-                    published = datetime(*entry.published_parsed[:6], tzinfo=KST)
+                    published = datetime(
+                        *entry.published_parsed[:6], tzinfo=timezone.utc
+                    ).astimezone(KST)
                 except Exception:
                     published = now
 
@@ -470,10 +487,14 @@ def fetch_rss(url, limit=8, max_age_days=3, blocked_domains=None):
                 "published": published.strftime("%m/%d %H:%M") if published else "",
                 "source": source,
                 "content": content,
+                "_pub_dt": published or now - timedelta(days=max_age_days),
             })
 
-            if len(articles) >= limit:
-                break
+        # 발행일 내림차순 정렬 후 상위 limit개만 유지
+        articles.sort(key=lambda a: a["_pub_dt"], reverse=True)
+        articles = articles[:limit]
+        for a in articles:
+            a.pop("_pub_dt", None)
 
     except Exception as e:
         print(f"[뉴스] RSS 수집 오류: {e}")
